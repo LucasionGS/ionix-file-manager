@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -128,6 +129,15 @@ type contextMenuModel struct {
 }
 
 // ---------------------------------------------------------------------------
+// Delete confirmation modal
+// ---------------------------------------------------------------------------
+
+type deleteModal struct {
+	open   bool
+	target appfs.Entry // entry to be deleted
+}
+
+// ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
 
@@ -175,6 +185,39 @@ func filterAndSort(entries []appfs.Entry, query string) []appfs.Entry {
 		out[i] = r.entry
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Editor
+// ---------------------------------------------------------------------------
+
+type editorClosedMsg struct{ err error }
+
+// defaultEditor returns the user's preferred editor by checking $VISUAL,
+// $EDITOR, then falling back to common editors found in PATH.
+func defaultEditor() string {
+	for _, env := range []string{"VISUAL", "EDITOR"} {
+		if v := os.Getenv(env); v != "" {
+			return v
+		}
+	}
+	for _, name := range []string{"nano", "vim", "vi"} {
+		if _, err := exec.LookPath(name); err == nil {
+			return name
+		}
+	}
+	return ""
+}
+
+// openInEditorCmd suspends the TUI and opens path in editor.
+// editor may contain arguments (e.g. "vim -u NONE").
+func openInEditorCmd(editor, path string) tea.Cmd {
+	parts := strings.Fields(editor)
+	parts = append(parts, path)
+	c := exec.Command(parts[0], parts[1:]...)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorClosedMsg{err: err}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +269,164 @@ func loadPreviewCmd(path string) tea.Cmd {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Image modal
+// ---------------------------------------------------------------------------
+
+type imageModalCacheEntry struct {
+	encoded string
+	imgW    int
+	imgH    int
+}
+
+type imageModalState struct {
+	open    bool
+	path    string
+	encoded string // base64-encoded PNG, "" while loading
+	imgW    int
+	imgH    int
+	cache   map[string]imageModalCacheEntry
+}
+
+type imageModalLoadedMsg struct {
+	path    string
+	encoded string
+	imgW    int
+	imgH    int
+}
+
+// imageModalMaxPx is the longest edge (in pixels) we scale modal images down to.
+// Larger than previewMaxPx so the full-screen modal looks crisp.
+const imageModalMaxPx = 2048
+
+func loadImageModalCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return imageModalLoadedMsg{path: path}
+		}
+		img, _, err := image.Decode(bytes.NewReader(data))
+		if err != nil {
+			return imageModalLoadedMsg{path: path}
+		}
+		img = scaleDown(img, imageModalMaxPx, imageModalMaxPx)
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			return imageModalLoadedMsg{path: path}
+		}
+		b := img.Bounds()
+		return imageModalLoadedMsg{
+			path:    path,
+			encoded: kitty.Encode(buf.Bytes()),
+			imgW:    b.Dx(),
+			imgH:    b.Dy(),
+		}
+	}
+}
+
+// openImageModal initialises the modal for path, re-using any existing cache,
+// and kicks off a load + neighbour preload.
+func (m *Model) openImageModal(path string) tea.Cmd {
+	cache := m.imageModal.cache
+	if cache == nil {
+		cache = make(map[string]imageModalCacheEntry)
+	}
+	if ce, ok := cache[path]; ok {
+		m.imageModal = imageModalState{
+			open:    true,
+			path:    path,
+			encoded: ce.encoded,
+			imgW:    ce.imgW,
+			imgH:    ce.imgH,
+			cache:   cache,
+		}
+		// Still preload neighbours.
+		visible := m.visibleEntries()
+		var imgIndices []int
+		for i, e := range visible {
+			if !e.IsDir && appfs.IsImage(e.Name) {
+				imgIndices = append(imgIndices, i)
+			}
+		}
+		for ci, idx := range imgIndices {
+			if visible[idx].Path == path {
+				return m.preloadNeighbours(imgIndices, ci, visible)
+			}
+		}
+		return nil
+	}
+	m.imageModal = imageModalState{open: true, path: path, cache: cache}
+	return loadImageModalCmd(path)
+}
+
+// imageModalStep moves the modal to the next (+1) or previous (-1) image in
+// the visible entry list. Returns a load command, or nil if no neighbour exists.
+func (m *Model) imageModalStep(delta int) tea.Cmd {
+	visible := m.visibleEntries()
+	// Collect image-only indices in visible order.
+	var imgIndices []int
+	for i, e := range visible {
+		if !e.IsDir && appfs.IsImage(e.Name) {
+			imgIndices = append(imgIndices, i)
+		}
+	}
+	if len(imgIndices) == 0 {
+		return nil
+	}
+	// Find the current image.
+	cur := -1
+	for i, idx := range imgIndices {
+		if visible[idx].Path == m.imageModal.path {
+			cur = i
+			break
+		}
+	}
+	if cur == -1 {
+		return nil
+	}
+	next := cur + delta
+	if next < 0 || next >= len(imgIndices) {
+		return nil
+	}
+	entry := visible[imgIndices[next]]
+	cache := m.imageModal.cache
+	// Reuse cached data immediately if available.
+	if ce, ok := cache[entry.Path]; ok {
+		m.imageModal = imageModalState{
+			open:    true,
+			path:    entry.Path,
+			encoded: ce.encoded,
+			imgW:    ce.imgW,
+			imgH:    ce.imgH,
+			cache:   cache,
+		}
+		// Pre-load neighbours in the background.
+		return m.preloadNeighbours(imgIndices, next, visible)
+	}
+	m.imageModal = imageModalState{open: true, path: entry.Path, cache: cache}
+	return tea.Batch(loadImageModalCmd(entry.Path), m.preloadNeighbours(imgIndices, next, visible))
+}
+
+// preloadNeighbours issues background load commands for the immediate neighbours
+// of curIdx in imgIndices that are not yet cached.
+func (m *Model) preloadNeighbours(imgIndices []int, curIdx int, visible []appfs.Entry) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, delta := range []int{-1, 1} {
+		ni := curIdx + delta
+		if ni < 0 || ni >= len(imgIndices) {
+			continue
+		}
+		p := visible[imgIndices[ni]].Path
+		if _, cached := m.imageModal.cache[p]; !cached {
+			cmds = append(cmds, loadImageModalCmd(p))
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
 // scaleDown resizes src so neither dimension exceeds maxW×maxH, preserving
 // aspect ratio. Returns src unchanged if it already fits.
 func scaleDown(src image.Image, maxW, maxH int) image.Image {
@@ -271,6 +472,7 @@ var keyMap = struct {
 	Paste                 key.Binding
 	Search                key.Binding
 	ToggleDetails         key.Binding
+	Delete                key.Binding
 	Quit                  key.Binding
 }{
 	Up:            key.NewBinding(key.WithKeys("up", "k")),
@@ -285,6 +487,7 @@ var keyMap = struct {
 	Paste:         key.NewBinding(key.WithKeys("ctrl+v")),
 	Search:        key.NewBinding(key.WithKeys("f")),
 	ToggleDetails: key.NewBinding(key.WithKeys("d")),
+	Delete:        key.NewBinding(key.WithKeys("delete", "D")),
 	Quit:          key.NewBinding(key.WithKeys("q")),
 }
 
@@ -310,12 +513,15 @@ type Model struct {
 
 	clipboard      fileClipboard
 	contextMenu    contextMenuModel
+	deleteConfirm  deleteModal
+	imageModal     imageModalState
 	search         searchModel
 	showDetails    bool
 	previewPath    string
 	previewEncoded string // base64-encoded, ready for kitty.Place
 	previewW       int
 	previewH       int
+	previewCache   map[string]imageModalCacheEntry // reuses imageModalCacheEntry: encoded+dims
 }
 
 func buildBookmarks() []bookmark {
@@ -398,7 +604,20 @@ func (m Model) maybeLoadPreview() tea.Cmd {
 		return nil
 	}
 	if e.Path == m.previewPath {
-		return nil // already loaded
+		return nil // already displayed
+	}
+	// Serve from cache instantly by updating state fields directly.
+	// Because maybeLoadPreview has a value receiver we can't mutate m here;
+	// instead return a synthetic already-resolved message via a Cmd.
+	if ce, ok := m.previewCache[e.Path]; ok {
+		return func() tea.Msg {
+			return previewLoadedMsg{
+				path:    e.Path,
+				encoded: ce.encoded,
+				imgW:    ce.imgW,
+				imgH:    ce.imgH,
+			}
+		}
 	}
 	return loadPreviewCmd(e.Path)
 }
@@ -427,6 +646,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case previewLoadedMsg:
 		if msg.encoded != "" {
+			if m.previewCache == nil {
+				m.previewCache = make(map[string]imageModalCacheEntry)
+			}
+			m.previewCache[msg.path] = imageModalCacheEntry{
+				encoded: msg.encoded,
+				imgW:    msg.imgW,
+				imgH:    msg.imgH,
+			}
 			m.previewPath = msg.path
 			m.previewEncoded = msg.encoded
 			m.previewW = msg.imgW
@@ -434,17 +661,72 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case imageModalLoadedMsg:
+		if m.imageModal.open && msg.encoded != "" {
+			if m.imageModal.cache == nil {
+				m.imageModal.cache = make(map[string]imageModalCacheEntry)
+			}
+			m.imageModal.cache[msg.path] = imageModalCacheEntry{
+				encoded: msg.encoded,
+				imgW:    msg.imgW,
+				imgH:    msg.imgH,
+			}
+			if msg.path == m.imageModal.path {
+				m.imageModal.encoded = msg.encoded
+				m.imageModal.imgW = msg.imgW
+				m.imageModal.imgH = msg.imgH
+			}
+		}
+		return m, nil
+
+	case editorClosedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("editor error: %v", msg.err)
+		}
+		m.entries, _ = m.loadEntries()
+		return m, m.maybeLoadPreview()
+
 	case tea.KeyMsg:
+		// Image modal captures all input while open.
+		if m.imageModal.open {
+			switch {
+			case msg.String() == "q" || msg.String() == "Q" || msg.Type == tea.KeyEsc:
+				m.imageModal = imageModalState{}
+				return m, nil
+			case key.Matches(msg, keyMap.Left):
+				if cmd := m.imageModalStep(-1); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			case key.Matches(msg, keyMap.Right):
+				if cmd := m.imageModalStep(1); cmd != nil {
+					return m, cmd
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// Context menu captures all input while open.
 		if m.contextMenu.open {
 			m = m.updateContextMenu(msg)
 			return m, nil
 		}
 
+		// Delete confirmation modal captures all input while open.
+		if m.deleteConfirm.open {
+			m = m.updateDeleteModal(msg)
+			return m, m.maybeLoadPreview()
+		}
+
 		// Search captures most input while active.
 		if m.search.active {
-			m = m.updateSearch(msg)
-			return m, nil
+			var searchCmd tea.Cmd
+			m, searchCmd = m.updateSearch(msg)
+			if searchCmd != nil {
+				return m, searchCmd
+			}
+			return m, m.maybeLoadPreview()
 		}
 
 		switch {
@@ -492,6 +774,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.offset = 0
 			m.statusMsg = ""
 
+		case key.Matches(msg, keyMap.Delete):
+			visible := m.visibleEntries()
+			if m.focus == focusList && len(visible) > 0 {
+				m.deleteConfirm = deleteModal{open: true, target: visible[m.cursor]}
+				m.statusMsg = ""
+			}
+
 		case key.Matches(msg, keyMap.OpenMenu):
 			m.contextMenu.open = true
 			m.contextMenu.cursor = 0
@@ -518,7 +807,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.focus == focusSidebar {
 					m = m.updateSidebar(msg)
 				} else {
-					m = m.updateList(msg)
+					var listCmd tea.Cmd
+					m, listCmd = m.updateList(msg)
+					if listCmd != nil {
+						return m, listCmd
+					}
 				}
 			}
 		}
@@ -629,20 +922,36 @@ func (m Model) updateSidebar(msg tea.KeyMsg) Model {
 	return m
 }
 
-func (m Model) updateSearch(msg tea.KeyMsg) Model {
+func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
+	switch msg.String() {
+	case "y", "Y":
+		target := m.deleteConfirm.target
+		m.deleteConfirm = deleteModal{}
+		if err := appfs.DeleteEntry(target.Path); err != nil {
+			m.statusMsg = fmt.Sprintf("delete error: %v", err)
+		} else {
+			m.statusMsg = fmt.Sprintf("deleted  %s", target.Name)
+			m.entries, _ = m.loadEntries()
+			if m.cursor >= len(m.entries) && m.cursor > 0 {
+				m.cursor = len(m.entries) - 1
+			}
+			m.previewPath = ""
+			m.previewEncoded = ""
+		}
+	default:
+		// Any other key (n, esc, q, etc.) cancels.
+		m.deleteConfirm = deleteModal{}
+	}
+	return m
+}
+
+func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
 	listH := m.listHeight()
 	visible := m.visibleEntries()
 
 	switch msg.Type {
 	case tea.KeyEsc:
-		// Cancel: close search, restore position
-		m.search.active = false
-		m.search.query = ""
-		m.cursor = 0
-		m.offset = 0
-
-	case tea.KeyEnter:
-		// Confirm: close search, leave cursor on the selected item in the full list
+		// Close search and land the cursor on the selected item in the full list.
 		if len(visible) > 0 && m.cursor < len(visible) {
 			selectedPath := visible[m.cursor].Path
 			m.search.active = false
@@ -659,6 +968,52 @@ func (m Model) updateSearch(msg tea.KeyMsg) Model {
 		} else {
 			m.search.active = false
 			m.search.query = ""
+		}
+
+	case tea.KeyEnter:
+		// Execute the action on the selected entry immediately.
+		if len(visible) == 0 || m.cursor >= len(visible) {
+			m.search.active = false
+			m.search.query = ""
+			break
+		}
+		entry := visible[m.cursor]
+		m.search.active = false
+		m.search.query = ""
+
+		for i, e := range m.entries {
+			if e.Path == entry.Path {
+				m.cursor = i
+				if m.cursor >= m.offset+listH {
+					m.offset = m.cursor - listH/2
+				}
+				break
+			}
+		}
+
+		if entry.IsDir {
+			m.cwd = entry.Path
+			m.cursor = 0
+			m.offset = 0
+			m.entries, m.err = m.loadEntries()
+			if m.err != nil {
+				m.statusMsg = fmt.Sprintf("error: %v", m.err)
+				m.err = nil
+				m.cwd = filepath.Dir(m.cwd)
+				m.entries, _ = m.loadEntries()
+			}
+		} else if appfs.IsImage(entry.Name) {
+			if !kitty.IsSupported() {
+				m.statusMsg = "image preview requires kitty terminal"
+			} else {
+				return m, m.openImageModal(entry.Path)
+			}
+		} else if appfs.IsText(entry.Path) {
+			editor := defaultEditor()
+			if editor != "" {
+				return m, openInEditorCmd(editor, entry.Path)
+			}
+			m.statusMsg = "no editor found (set $VISUAL or $EDITOR)"
 		}
 
 	case tea.KeyBackspace:
@@ -696,10 +1051,10 @@ func (m Model) updateSearch(msg tea.KeyMsg) Model {
 		m.offset = 0
 	}
 
-	return m
+	return m, nil
 }
 
-func (m Model) updateList(msg tea.KeyMsg) Model {
+func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 	listH := m.listHeight()
 	visible := m.visibleEntries()
 
@@ -748,6 +1103,18 @@ func (m Model) updateList(msg tea.KeyMsg) Model {
 				m.cwd = filepath.Dir(m.cwd)
 				m.entries, _ = m.loadEntries()
 			}
+		} else if appfs.IsImage(entry.Name) {
+			if !kitty.IsSupported() {
+				m.statusMsg = "image preview requires kitty terminal"
+			} else {
+				return m, m.openImageModal(entry.Path)
+			}
+		} else if appfs.IsText(entry.Path) {
+			editor := defaultEditor()
+			if editor != "" {
+				return m, openInEditorCmd(editor, entry.Path)
+			}
+			m.statusMsg = "no editor found (set $VISUAL or $EDITOR)"
 		}
 
 	case key.Matches(msg, keyMap.GoHome):
@@ -765,7 +1132,7 @@ func (m Model) updateList(msg tea.KeyMsg) Model {
 		m.offset = 0
 		m.entries, m.err = m.loadEntries()
 	}
-	return m
+	return m, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +1157,14 @@ func (m Model) View() string {
 		return m.renderWithOverlay()
 	}
 
+	if m.deleteConfirm.open {
+		return m.renderDeleteModal()
+	}
+
+	if m.imageModal.open {
+		return m.renderImageModal()
+	}
+
 	view := m.renderNormal()
 
 	if kitty.IsSupported() {
@@ -803,11 +1178,69 @@ func (m Model) View() string {
 	return view
 }
 
+func (m Model) renderImageModal() string {
+	// Modal occupies ~85% of the terminal.
+	modalW := m.width * 17 / 20
+	modalH := m.height * 17 / 20
+	if modalW < 20 {
+		modalW = 20
+	}
+	if modalH < 8 {
+		modalH = 8
+	}
+
+	// StylePaneActive adds border(1 each side) + padding(1 each side left/right).
+	// innerW/innerH are the content dimensions passed to lipgloss.
+	innerW := modalW - 4 // 2 borders + 2 padding (left/right)
+	innerH := modalH - 2 // 2 borders (top/bottom), no vertical padding
+
+	imgAreaCols := innerW
+	imgAreaRows := innerH - 1 // reserve the last row for the hint
+
+	// Top row: image path.
+	pathLine := StyleDim.Render(m.imageModal.path)
+
+	imgAreaRows-- // one row used by path at top
+
+	var lines []string
+	lines = append(lines, pathLine)
+	if m.imageModal.encoded == "" {
+		lines = append(lines, StyleDim.Render("  loading…"))
+		for len(lines) < imgAreaRows+1 {
+			lines = append(lines, "")
+		}
+	} else {
+		for len(lines) < imgAreaRows+1 {
+			lines = append(lines, "")
+		}
+	}
+	lines = append(lines, StyleDim.Render("  ←/→ cycle    q  close"))
+
+	box := StylePaneActive.Width(innerW).Height(innerH).Render(strings.Join(lines, "\n"))
+	out := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+
+	// Kitty image is placed on top of the box using absolute terminal coordinates.
+	// col/row are 1-based. Offset 3 = border(1)+padding(1)+1-based(1) for col;
+	// Offset 2 = border(1)+1-based(1) for row.
+	out += kitty.ClearAll()
+	if m.imageModal.encoded != "" {
+		c, r := calcPreviewSize(m.imageModal.imgW, m.imageModal.imgH, imgAreaCols, imgAreaRows)
+		// Center the image within the modal's content area.
+		// +1 extra row offset to skip the path line at the top.
+		col := (m.width-modalW)/2 + 3 + (imgAreaCols-c)/2
+		row := (m.height-modalH)/2 + 2 + 1 + (imgAreaRows-r)/2
+		out += kitty.Place(m.imageModal.encoded, col, row, c, r, 2)
+	}
+	return out
+}
+
 func (m Model) renderNormal() string {
 	listH := m.listHeight()
 	listW := m.fileListWidth()
 
-	titleLine := StyleTitle.Render(" ionix ") +
+	hn, _ := os.Hostname()
+
+	titleLine := StyleTitle.Render(" "+hn+" ") +
 		StyleDim.Render(" › ") +
 		StyleNormal.Render(m.cwd)
 
@@ -823,6 +1256,31 @@ func (m Model) renderNormal() string {
 		return titleLine + "\n" + body + "\n" + m.renderSearchBar() + "\n" + statusLine
 	}
 	return titleLine + "\n" + body + "\n" + statusLine
+}
+
+func (m Model) renderDeleteModal() string {
+	target := m.deleteConfirm.target
+	kind := "file"
+	if target.IsDir {
+		kind = "directory"
+	}
+
+	const modalW = 46
+	nameStyle := StyleSelected.Bold(true)
+	name := nameStyle.Render(target.Name)
+	if target.IsDir {
+		name = StyleDir.Bold(true).Render(target.Name + "/")
+	}
+
+	warning := StyleDim.Render(fmt.Sprintf("Delete this %s permanently?", kind))
+	nameLine := name
+	confirm := StyleNormal.Render("  ") + StyleCursor.Render(" y ") +
+		StyleNormal.Render(" confirm   ") +
+		StyleDim.Render("any other key") + StyleNormal.Render(" cancel")
+
+	content := strings.Join([]string{"", warning, nameLine, "", confirm, ""}, "\n")
+	box := StylePaneActive.Width(modalW).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m Model) renderWithOverlay() string {

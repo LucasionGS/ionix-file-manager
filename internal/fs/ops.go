@@ -68,6 +68,11 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
+// DeleteEntry removes a file or directory (recursively).
+func DeleteEntry(path string) error {
+	return os.RemoveAll(path)
+}
+
 // MoveEntry moves src to dst. Falls back to copy+delete on cross-device moves.
 func MoveEntry(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {

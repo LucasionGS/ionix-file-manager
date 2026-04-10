@@ -59,6 +59,36 @@ func IsImage(name string) bool {
 	return false
 }
 
+// IsText reports whether the file at path is likely a text file.
+// It checks for known binary extensions first, then reads up to 512 bytes
+// and returns false if any null byte is found.
+func IsText(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".avif",
+		".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+		".exe", ".so", ".dylib", ".bin", ".dmg", ".iso",
+		".mp3", ".mp4", ".mkv", ".avi", ".mov", ".flac", ".ogg", ".wav",
+		".ttf", ".otf", ".woff", ".woff2":
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, _ := f.Read(buf)
+	if n == 0 {
+		return false
+	}
+	for _, b := range buf[:n] {
+		if b == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // ImageMIME returns the MIME type for a recognised image filename, or an error.
 func ImageMIME(name string) (string, error) {
 	switch strings.ToLower(filepath.Ext(name)) {
