@@ -34,6 +34,7 @@ type focus int
 const (
 	focusList focus = iota
 	focusSidebar
+	focusSplit
 )
 
 // focusShortcut maps a key directly to a focus target.
@@ -45,7 +46,6 @@ type focusShortcut struct {
 
 var focusShortcuts = []focusShortcut{
 	{binding: key.NewBinding(key.WithKeys("w")), target: focusSidebar},
-	{binding: key.NewBinding(key.WithKeys("e")), target: focusList},
 }
 
 // ---------------------------------------------------------------------------
@@ -92,10 +92,12 @@ type menuEntry struct {
 // buildMenu returns only the context menu entries that apply to the current selection.
 // Add new items here; the disabled-item pattern is replaced by simply omitting entries.
 func (m *Model) buildMenu() []menuEntry {
-	hasSelection := len(m.entries) > 0
+	active := m.activeVisible()
+	cursor := m.activeCursor()
+	hasSelection := len(active) > 0
 	selected := func() appfs.Entry {
 		if hasSelection {
-			return m.entries[m.cursor]
+			return active[cursor]
 		}
 		return appfs.Entry{}
 	}
@@ -485,6 +487,8 @@ var keyMap = struct {
 	Delete                key.Binding
 	Quit                  key.Binding
 	ToggleFavorite        key.Binding
+	CyclePanes            key.Binding
+	ToggleSplit           key.Binding
 }{
 	Up:             key.NewBinding(key.WithKeys("up", "k")),
 	Down:           key.NewBinding(key.WithKeys("down", "j")),
@@ -501,6 +505,8 @@ var keyMap = struct {
 	Delete:         key.NewBinding(key.WithKeys("delete", "D")),
 	Quit:           key.NewBinding(key.WithKeys("q")),
 	ToggleFavorite: key.NewBinding(key.WithKeys("b")),
+	CyclePanes:     key.NewBinding(key.WithKeys("e")),
+	ToggleSplit:    key.NewBinding(key.WithKeys("s")),
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +542,12 @@ type Model struct {
 	previewH       int
 	previewCache   map[string]imageModalCacheEntry // reuses imageModalCacheEntry: encoded+dims
 	pendingSelect  string                          // filename to select on first WindowSizeMsg
+
+	showSplit bool
+	cwd2      string
+	entries2  []appfs.Entry
+	cursor2   int
+	offset2   int
 }
 
 func buildBookmarks() []bookmark {
@@ -635,11 +647,14 @@ func (m Model) loadEntries() ([]appfs.Entry, error) {
 	return filtered, nil
 }
 
-// fileListWidth returns the column width allocated to the file list pane.
+// fileListWidth returns the column width allocated to each file list pane.
 func (m Model) fileListWidth() int {
 	w := m.width - sidebarWidth
 	if m.showDetails {
 		w -= detailsWidth
+	}
+	if m.showSplit {
+		w /= 2
 	}
 	return w
 }
@@ -651,11 +666,12 @@ func (m *Model) maybeLoadPreview() tea.Cmd {
 	if !m.showDetails || !kitty.IsSupported() {
 		return nil
 	}
-	visible := m.visibleEntries()
-	if len(visible) == 0 || m.cursor >= len(visible) {
+	visible := m.activeVisible()
+	cursor := m.activeCursor()
+	if len(visible) == 0 || cursor >= len(visible) {
 		return nil
 	}
-	e := visible[m.cursor]
+	e := visible[cursor]
 	if e.IsDir || !appfs.IsImage(e.Name) {
 		// Not an image — clear any leftover preview.
 		m.previewPath = ""
@@ -686,6 +702,48 @@ func (m Model) visibleEntries() []appfs.Entry {
 		return filterAndSort(m.entries, m.search.query)
 	}
 	return m.entries
+}
+
+// activeVisible returns visible entries for the currently focused file pane.
+func (m Model) activeVisible() []appfs.Entry {
+	if m.focus == focusSplit {
+		return m.entries2
+	}
+	return m.visibleEntries()
+}
+
+// activeCursor returns the cursor index for the currently focused file pane.
+func (m Model) activeCursor() int {
+	if m.focus == focusSplit {
+		return m.cursor2
+	}
+	return m.cursor
+}
+
+// activeCwd returns the working directory of the currently focused file pane.
+func (m Model) activeCwd() string {
+	if m.focus == focusSplit {
+		return m.cwd2
+	}
+	return m.cwd
+}
+
+// loadEntries2 loads and filters directory entries for the second pane.
+func (m Model) loadEntries2() ([]appfs.Entry, error) {
+	all, err := appfs.List(m.cwd2)
+	if err != nil {
+		return nil, err
+	}
+	if m.showHidden {
+		return all, nil
+	}
+	filtered := all[:0]
+	for _, e := range all {
+		if !appfs.IsHidden(e.Name) {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -798,15 +856,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case key.Matches(msg, keyMap.Copy):
-			if len(m.entries) > 0 {
-				e := m.entries[m.cursor]
+			av := m.activeVisible()
+			if len(av) > 0 {
+				e := av[m.activeCursor()]
 				m.clipboard = fileClipboard{op: clipCopy, path: e.Path, name: e.Name}
 				m.statusMsg = fmt.Sprintf("copied  %s", e.Name)
 			}
 
 		case key.Matches(msg, keyMap.Paste):
 			if m.clipboard.op != clipNone {
-				dst := filepath.Join(m.cwd, m.clipboard.name)
+				dst := filepath.Join(m.activeCwd(), m.clipboard.name)
 				var err error
 				if m.clipboard.op == clipCopy {
 					err = appfs.CopyEntry(m.clipboard.path, dst)
@@ -820,7 +879,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = fmt.Sprintf("error: %v", err)
 				} else {
 					m.statusMsg = fmt.Sprintf("pasted  %s", m.clipboard.name)
-					m.entries, _ = m.loadEntries()
+					if m.focus == focusSplit {
+						m.entries2, _ = m.loadEntries2()
+					} else {
+						m.entries, _ = m.loadEntries()
+					}
 				}
 			}
 
@@ -836,16 +899,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 
 		case key.Matches(msg, keyMap.Search):
-			m.search.active = true
-			m.search.query = ""
-			m.cursor = 0
-			m.offset = 0
-			m.statusMsg = ""
+			if m.focus != focusSplit {
+				m.search.active = true
+				m.search.query = ""
+				m.cursor = 0
+				m.offset = 0
+				m.statusMsg = ""
+			}
 
 		case key.Matches(msg, keyMap.Delete):
-			visible := m.visibleEntries()
-			if m.focus == focusList && len(visible) > 0 {
-				m.deleteConfirm = deleteModal{open: true, target: visible[m.cursor]}
+			visible := m.activeVisible()
+			if m.focus != focusSidebar && len(visible) > 0 {
+				m.deleteConfirm = deleteModal{open: true, target: visible[m.activeCursor()]}
 				m.statusMsg = ""
 			}
 
@@ -859,6 +924,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusSidebar
 			} else {
 				m.focus = focusList
+			}
+
+		case key.Matches(msg, keyMap.CyclePanes):
+			if m.showSplit {
+				if m.focus == focusSplit {
+					m.focus = focusList
+				} else {
+					m.focus = focusSplit
+				}
+			} else {
+				m.focus = focusList
+			}
+
+		case key.Matches(msg, keyMap.ToggleSplit):
+			if m.showSplit {
+				m.showSplit = false
+				if m.focus == focusSplit {
+					m.focus = focusList
+				}
+			} else {
+				m.showSplit = true
+				m.cwd2 = m.cwd
+				m.cursor2 = 0
+				m.offset2 = 0
+				m.entries2, _ = m.loadEntries2()
+				m.focus = focusSplit
 			}
 
 		default:
@@ -915,19 +1006,22 @@ func (m Model) updateContextMenu(msg tea.KeyMsg) Model {
 func (m Model) execMenuAction(item menuEntry) Model {
 	m.contextMenu.open = false
 
+	active := m.activeVisible()
+	cursor := m.activeCursor()
+
 	switch item.action {
 	case menuCopy:
-		e := m.entries[m.cursor]
+		e := active[cursor]
 		m.clipboard = fileClipboard{op: clipCopy, path: e.Path, name: e.Name}
 		m.statusMsg = fmt.Sprintf("copied  %s", e.Name)
 
 	case menuCut:
-		e := m.entries[m.cursor]
+		e := active[cursor]
 		m.clipboard = fileClipboard{op: clipCut, path: e.Path, name: e.Name}
 		m.statusMsg = fmt.Sprintf("cut  %s", e.Name)
 
 	case menuPaste:
-		dst := filepath.Join(m.cwd, m.clipboard.name)
+		dst := filepath.Join(m.activeCwd(), m.clipboard.name)
 		var err error
 		if m.clipboard.op == clipCopy {
 			err = appfs.CopyEntry(m.clipboard.path, dst)
@@ -941,11 +1035,15 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			m.statusMsg = fmt.Sprintf("error: %v", err)
 		} else {
 			m.statusMsg = fmt.Sprintf("pasted  %s", filepath.Base(dst))
-			m.entries, _ = m.loadEntries()
+			if m.focus == focusSplit {
+				m.entries2, _ = m.loadEntries2()
+			} else {
+				m.entries, _ = m.loadEntries()
+			}
 		}
 
 	case menuCopyPath:
-		e := m.entries[m.cursor]
+		e := active[cursor]
 		if err := clipboard.Write(e.Path); err != nil {
 			m.statusMsg = fmt.Sprintf("clipboard error: %v", err)
 		} else {
@@ -953,7 +1051,7 @@ func (m Model) execMenuAction(item menuEntry) Model {
 		}
 
 	case menuCopyImage:
-		e := m.entries[m.cursor]
+		e := active[cursor]
 		mime, _ := appfs.ImageMIME(e.Name)
 		if err := clipboard.WriteImage(e.Path, mime); err != nil {
 			m.statusMsg = fmt.Sprintf("clipboard error: %v", err)
@@ -962,7 +1060,7 @@ func (m Model) execMenuAction(item menuEntry) Model {
 		}
 
 	case menuFavoriteToggle:
-		e := m.entries[m.cursor]
+		e := active[cursor]
 		if e.IsDir {
 			wasFav := m.isFavorite(e.Path)
 			m.toggleFavorite(e.Path)
@@ -1021,6 +1119,12 @@ func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 			m.entries, _ = m.loadEntries()
 			if m.cursor >= len(m.entries) && m.cursor > 0 {
 				m.cursor = len(m.entries) - 1
+			}
+			if m.showSplit {
+				m.entries2, _ = m.loadEntries2()
+				if m.cursor2 >= len(m.entries2) && m.cursor2 > 0 {
+					m.cursor2 = len(m.entries2) - 1
+				}
 			}
 			m.previewPath = ""
 			m.previewEncoded = ""
@@ -1142,6 +1246,9 @@ func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
 }
 
 func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if m.focus == focusSplit {
+		return m.updateSplitPane(msg)
+	}
 	listH := m.listHeight()
 	visible := m.visibleEntries()
 
@@ -1231,6 +1338,11 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.cursor = 0
 		m.offset = 0
 		m.entries, m.err = m.loadEntries()
+		if m.showSplit {
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+		}
 		_ = appconfig.Save(appconfig.Config{
 			ShowDetails: m.showDetails,
 			ShowHidden:  m.showHidden,
@@ -1239,6 +1351,109 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case key.Matches(msg, keyMap.ToggleFavorite):
 		if len(visible) > 0 {
 			e := visible[m.cursor]
+			if e.IsDir {
+				wasFav := m.isFavorite(e.Path)
+				m.toggleFavorite(e.Path)
+				if wasFav {
+					m.statusMsg = fmt.Sprintf("removed from favorites  %s", e.Name)
+				} else {
+					m.statusMsg = fmt.Sprintf("added to favorites  %s", e.Name)
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
+	listH := m.listHeight()
+
+	switch {
+	case key.Matches(msg, keyMap.Up):
+		if m.cursor2 > 0 {
+			m.cursor2--
+			if m.cursor2 < m.offset2 {
+				m.offset2 = m.cursor2
+			}
+		}
+
+	case key.Matches(msg, keyMap.Down):
+		if m.cursor2 < len(m.entries2)-1 {
+			m.cursor2++
+			if m.cursor2 >= m.offset2+listH {
+				m.offset2 = m.cursor2 - listH + 1
+			}
+		}
+
+	case key.Matches(msg, keyMap.Left):
+		parent := filepath.Dir(m.cwd2)
+		if parent != m.cwd2 {
+			prevDir := m.cwd2
+			m.cwd2 = parent
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+			prevName := filepath.Base(prevDir)
+			for i, e := range m.entries2 {
+				if e.Name == prevName {
+					m.cursor2 = i
+					if m.cursor2 >= listH {
+						m.offset2 = m.cursor2 - listH/2
+					}
+					break
+				}
+			}
+		}
+
+	case key.Matches(msg, keyMap.Right):
+		if len(m.entries2) == 0 {
+			break
+		}
+		entry := m.entries2[m.cursor2]
+		if entry.IsDir {
+			m.cwd2 = entry.Path
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+		} else if appfs.IsImage(entry.Name) {
+			if !kitty.IsSupported() {
+				m.statusMsg = "image preview requires kitty terminal"
+			} else {
+				return m, m.openImageModal(entry.Path)
+			}
+		} else if appfs.IsText(entry.Path) {
+			editor := defaultEditor()
+			if editor != "" {
+				return m, openInEditorCmd(editor, entry.Path)
+			}
+			m.statusMsg = "no editor found (set $VISUAL or $EDITOR)"
+		}
+
+	case key.Matches(msg, keyMap.GoHome):
+		home, err := os.UserHomeDir()
+		if err == nil {
+			m.cwd2 = home
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+		}
+
+	case key.Matches(msg, keyMap.ToggleHidden):
+		m.showHidden = !m.showHidden
+		m.cursor = 0
+		m.offset = 0
+		m.cursor2 = 0
+		m.offset2 = 0
+		m.entries, _ = m.loadEntries()
+		m.entries2, _ = m.loadEntries2()
+		_ = appconfig.Save(appconfig.Config{
+			ShowDetails: m.showDetails,
+			ShowHidden:  m.showHidden,
+		})
+
+	case key.Matches(msg, keyMap.ToggleFavorite):
+		if len(m.entries2) > 0 {
+			e := m.entries2[m.cursor2]
 			if e.IsDir {
 				wasFav := m.isFavorite(e.Path)
 				m.toggleFavorite(e.Path)
@@ -1361,8 +1576,14 @@ func (m Model) renderNormal() string {
 	titleLine := StyleTitle.Render(" "+hn+" ") +
 		StyleDim.Render(" › ") +
 		StyleNormal.Render(m.cwd)
+	if m.showSplit {
+		titleLine += StyleDim.Render("  |  ") + StyleNormal.Render(m.cwd2)
+	}
 
 	cols := []string{m.renderSidebar(listH), m.renderFileList(listH, listW)}
+	if m.showSplit {
+		cols = append(cols, m.renderFilePaneAt(listH, listW, m.entries2, m.cursor2, m.offset2, m.focus == focusSplit))
+	}
 	if m.showDetails {
 		cols = append(cols, m.renderDetails(listH))
 	}
@@ -1492,13 +1713,12 @@ func (m Model) renderSidebar(height int) string {
 	return paneStyle.Width(sidebarWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
 }
 
-func (m Model) renderFileList(height, width int) string {
+func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor, offset int, isActive bool) string {
 	innerW := width - 4
-	visible := m.visibleEntries()
 
 	var rows []string
-	for i := m.offset; i < len(visible) && i < m.offset+height; i++ {
-		e := visible[i]
+	for i := offset; i < len(entries) && i < offset+height; i++ {
+		e := entries[i]
 		name := e.Name
 		if e.IsDir {
 			name += "/"
@@ -1506,7 +1726,7 @@ func (m Model) renderFileList(height, width int) string {
 
 		var style lipgloss.Style
 		switch {
-		case i == m.cursor:
+		case i == cursor:
 			style = StyleCursor
 		case e.IsDir:
 			style = StyleDir
@@ -1517,7 +1737,7 @@ func (m Model) renderFileList(height, width int) string {
 		}
 
 		var rendered string
-		if i == m.cursor {
+		if i == cursor {
 			rendered = style.Width(innerW).Render(name)
 		} else {
 			rendered = style.MaxWidth(innerW).Render(name)
@@ -1530,10 +1750,14 @@ func (m Model) renderFileList(height, width int) string {
 	}
 
 	paneStyle := StylePane
-	if m.focus == focusList {
+	if isActive {
 		paneStyle = StylePaneActive
 	}
 	return paneStyle.Width(width - 2).Height(height).Render(strings.Join(rows, "\n"))
+}
+
+func (m Model) renderFileList(height, width int) string {
+	return m.renderFilePaneAt(height, width, m.visibleEntries(), m.cursor, m.offset, m.focus == focusList)
 }
 
 // calcPreviewSize returns the cell (cols, rows) that preserve the image's
@@ -1569,8 +1793,12 @@ func calcPreviewSize(imgW, imgH, maxCols, maxRows int) (cols, rows int) {
 
 func (m Model) renderKittyPreview() string {
 	listW := m.fileListWidth()
-	// 1-based column: past sidebar + file-list panes, then past left border+padding of details pane.
-	col := sidebarWidth + listW + 3
+	// 1-based column: past sidebar + all file-list panes, then past left border+padding of details pane.
+	paneCount := 1
+	if m.showSplit {
+		paneCount = 2
+	}
+	col := sidebarWidth + listW*paneCount + 3
 	row := 3 // title(1) + pane top border(1) + first content row(1)
 	maxCols := detailsWidth - 4
 	c, r := calcPreviewSize(m.previewW, m.previewH, maxCols, previewCellRows)
@@ -1581,15 +1809,16 @@ func (m Model) renderDetails(height int) string {
 	innerW := detailsWidth - 4
 	var rows []string
 
-	visible := m.visibleEntries()
-	if len(visible) == 0 || m.cursor >= len(visible) {
+	visible := m.activeVisible()
+	cursor := m.activeCursor()
+	if len(visible) == 0 || cursor >= len(visible) {
 		for len(rows) < height {
 			rows = append(rows, "")
 		}
 		return StylePane.Width(detailsWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
 	}
 
-	e := visible[m.cursor]
+	e := visible[cursor]
 
 	// Reserve space for image preview at the top of the panel.
 	isImageFile := !e.IsDir && appfs.IsImage(e.Name) && kitty.IsSupported()
@@ -1689,10 +1918,11 @@ func (m Model) buildStatus() string {
 		return " " + m.statusMsg
 	}
 
-	total := len(m.entries)
+	active := m.activeVisible()
+	total := len(active)
 	pos := 0
 	if total > 0 {
-		pos = m.cursor + 1
+		pos = m.activeCursor() + 1
 	}
 
 	clip := ""
@@ -1702,26 +1932,15 @@ func (m Model) buildStatus() string {
 		clip = fmt.Sprintf("  [cut: %s]", m.clipboard.name)
 	}
 
-	paneKeys := "tab/"
-
-	focusShortcutsMap := make(map[focus]key.Binding)
-	for _, sc := range focusShortcuts {
-		focusShortcutsMap[sc.target] = sc.binding
-	}
-
-	if m.focus == focusSidebar {
-		paneKeys += focusShortcutsMap[focusList].Keys()[0]
-	} else {
-		paneKeys += focusShortcutsMap[focusSidebar].Keys()[0]
-	}
-
 	parts := []string{
 		fmt.Sprintf("%d/%d", pos, total),
-		". menu",
-		"tab/w/e panes",
-		"H hidden",
-		"q quit",
+		"[.] Menu",
+		"[w] Sidebar",
+		"[e] Panes",
+		"[s] Split",
+		"[H] Hidden",
+		"[q] Quit",
 	}
 
-	return " " + strings.Join(parts, "  ") + clip
+	return " " + strings.Join(parts, " | ") + clip
 }
