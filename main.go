@@ -3,12 +3,13 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 	_ "image/gif"
 	_ "image/jpeg"
 
-"github.com/ion/ionix-file-manager/internal/ui"
+	"github.com/LucasionGS/ionix-file-manager/internal/ui"
 )
 
 func main() {
@@ -17,18 +18,25 @@ func main() {
 		fmt.Fprintf(os.Stderr, "cannot determine working directory: %v\n", err)
 		os.Exit(1)
 	}
+	selectName := ""
 
 	if len(os.Args) > 1 {
-		startDir = os.Args[1]
+		arg := os.Args[1]
+		info, err := os.Stat(arg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "no such file or directory: %s\n", arg)
+			os.Exit(1)
+		}
+		if info.IsDir() {
+			startDir = arg
+		} else {
+			// Argument is a file — open its parent and pre-select the file.
+			startDir = filepath.Dir(arg)
+			selectName = filepath.Base(arg)
+		}
 	}
 
-	info, err := os.Stat(startDir)
-	if err != nil || !info.IsDir() {
-		fmt.Fprintf(os.Stderr, "not a valid directory: %s\n", startDir)
-		os.Exit(1)
-	}
-
-	model := ui.New(startDir)
+	model := ui.New(startDir, selectName)
 	p := tea.NewProgram(
 		model,
 		tea.WithAltScreen(),

@@ -12,12 +12,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/LucasionGS/ionix-file-manager/internal/clipboard"
+	appconfig "github.com/LucasionGS/ionix-file-manager/internal/config"
+	appfs "github.com/LucasionGS/ionix-file-manager/internal/fs"
+	"github.com/LucasionGS/ionix-file-manager/internal/kitty"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/ion/ionix-file-manager/internal/clipboard"
-	appfs "github.com/ion/ionix-file-manager/internal/fs"
-	"github.com/ion/ionix-file-manager/internal/kitty"
 )
 
 const sidebarWidth = 22
@@ -522,6 +523,7 @@ type Model struct {
 	previewW       int
 	previewH       int
 	previewCache   map[string]imageModalCacheEntry // reuses imageModalCacheEntry: encoded+dims
+	pendingSelect  string                          // filename to select on first WindowSizeMsg
 }
 
 func buildBookmarks() []bookmark {
@@ -551,15 +553,27 @@ func buildBookmarks() []bookmark {
 	return result
 }
 
-func New(startDir string) Model {
+func New(startDir, selectName string) Model {
+	cfg, _ := appconfig.Load()
+	ApplyColors(cfg.Colors)
 	m := Model{
-		cwd:          startDir,
-		showHidden:   false,
+		cwd:          filepath.Clean(startDir),
+		showHidden:   cfg.ShowHidden,
+		showDetails:  cfg.ShowDetails,
 		kittySupport: kitty.IsSupported(),
 		focus:        focusList,
 		bookmarks:    buildBookmarks(),
 	}
 	m.entries, m.err = m.loadEntries()
+	if selectName != "" {
+		for i, e := range m.entries {
+			if e.Name == selectName {
+				m.cursor = i
+				m.pendingSelect = selectName
+				break
+			}
+		}
+	}
 	return m
 }
 
@@ -591,7 +605,8 @@ func (m Model) fileListWidth() int {
 
 // maybeLoadPreview returns a Cmd to load the selected image when the details
 // panel is open and the selection has changed. Returns nil when not needed.
-func (m Model) maybeLoadPreview() tea.Cmd {
+// As a side-effect it clears stale preview state when the selection is no longer an image.
+func (m *Model) maybeLoadPreview() tea.Cmd {
 	if !m.showDetails || !kitty.IsSupported() {
 		return nil
 	}
@@ -601,14 +616,15 @@ func (m Model) maybeLoadPreview() tea.Cmd {
 	}
 	e := visible[m.cursor]
 	if e.IsDir || !appfs.IsImage(e.Name) {
+		// Not an image — clear any leftover preview.
+		m.previewPath = ""
+		m.previewEncoded = ""
 		return nil
 	}
 	if e.Path == m.previewPath {
 		return nil // already displayed
 	}
-	// Serve from cache instantly by updating state fields directly.
-	// Because maybeLoadPreview has a value receiver we can't mutate m here;
-	// instead return a synthetic already-resolved message via a Cmd.
+	// Serve from cache instantly.
 	if ce, ok := m.previewCache[e.Path]; ok {
 		return func() tea.Msg {
 			return previewLoadedMsg{
@@ -642,6 +658,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.pendingSelect != "" {
+			listH := m.listHeight()
+			if m.cursor >= listH {
+				m.offset = m.cursor - listH/2
+			}
+			m.pendingSelect = ""
+		}
 		return m, m.maybeLoadPreview()
 
 	case previewLoadedMsg:
@@ -766,6 +789,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.previewPath = ""
 				m.previewEncoded = ""
 			}
+			_ = appconfig.Save(appconfig.Config{
+				ShowDetails: m.showDetails,
+				ShowHidden:  m.showHidden,
+			})
 
 		case key.Matches(msg, keyMap.Search):
 			m.search.active = true
@@ -1078,6 +1105,7 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case key.Matches(msg, keyMap.Left):
 		parent := filepath.Dir(m.cwd)
 		if parent != m.cwd {
+			prevDir := m.cwd
 			m.cwd = parent
 			m.cursor = 0
 			m.offset = 0
@@ -1085,6 +1113,18 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.previewPath = ""
 			m.previewEncoded = ""
 			m.entries, m.err = m.loadEntries()
+			// Re-select the folder we just came out of.
+			prevName := filepath.Base(prevDir)
+			listH := m.listHeight()
+			for i, e := range m.entries {
+				if e.Name == prevName {
+					m.cursor = i
+					if m.cursor >= listH {
+						m.offset = m.cursor - listH/2
+					}
+					break
+				}
+			}
 		}
 
 	case key.Matches(msg, keyMap.Right):
@@ -1131,6 +1171,10 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.cursor = 0
 		m.offset = 0
 		m.entries, m.err = m.loadEntries()
+		_ = appconfig.Save(appconfig.Config{
+			ShowDetails: m.showDetails,
+			ShowHidden:  m.showHidden,
+		})
 	}
 	return m, nil
 }
@@ -1259,6 +1303,10 @@ func (m Model) renderNormal() string {
 }
 
 func (m Model) renderDeleteModal() string {
+	clear := ""
+	if kitty.IsSupported() {
+		clear = kitty.ClearAll()
+	}
 	target := m.deleteConfirm.target
 	kind := "file"
 	if target.IsDir {
@@ -1280,10 +1328,14 @@ func (m Model) renderDeleteModal() string {
 
 	content := strings.Join([]string{"", warning, nameLine, "", confirm, ""}, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m Model) renderWithOverlay() string {
+	clear := ""
+	if kitty.IsSupported() {
+		clear = kitty.ClearAll()
+	}
 	const menuW = 26
 
 	var rows []string
@@ -1308,7 +1360,7 @@ func (m Model) renderWithOverlay() string {
 	hint := StyleDim.Render("  j/k navigate  enter select  esc close")
 	content := lipgloss.JoinVertical(lipgloss.Center, menuBox, hint)
 
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
 }
 
 func (m Model) renderSidebar(height int) string {

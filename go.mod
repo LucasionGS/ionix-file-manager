@@ -1,4 +1,4 @@
-module github.com/ion/ionix-file-manager
+module github.com/LucasionGS/ionix-file-manager
 
 go 1.26.2
 
