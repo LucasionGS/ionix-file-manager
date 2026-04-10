@@ -26,6 +26,10 @@ build() {
     export CGO_CXXFLAGS="${CXXFLAGS}"
     export CGO_LDFLAGS="${LDFLAGS}"
     go build -trimpath -mod=readonly -o bin/ifm .
+
+    # During build, for some reason, a library gets readonly files.
+    # We need to make them writable so that makepkg can clean up after itself.
+    chmod -R u+w "${GOPATH}/pkg/mod"
 }
 
 package() {
