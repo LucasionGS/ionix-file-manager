@@ -78,6 +78,7 @@ const (
 	menuPaste
 	menuCopyPath
 	menuCopyImage
+	menuFavoriteToggle
 	menuCancel
 )
 
@@ -118,6 +119,14 @@ func (m *Model) buildMenu() []menuEntry {
 
 	if e := selected(); hasSelection && !e.IsDir && appfs.IsImage(e.Name) {
 		items = append(items, menuEntry{icon: "󰋩", label: "Copy image", action: menuCopyImage})
+	}
+
+	if e := selected(); hasSelection && e.IsDir {
+		if m.isFavorite(e.Path) {
+			items = append(items, menuEntry{icon: "󰀻", label: "Remove favorite", action: menuFavoriteToggle})
+		} else {
+			items = append(items, menuEntry{icon: "󰀼", label: "Add to favorites", action: menuFavoriteToggle})
+		}
 	}
 
 	items = append(items, menuEntry{icon: "󰜺", label: "Cancel", action: menuCancel})
@@ -475,21 +484,23 @@ var keyMap = struct {
 	ToggleDetails         key.Binding
 	Delete                key.Binding
 	Quit                  key.Binding
+	ToggleFavorite        key.Binding
 }{
-	Up:            key.NewBinding(key.WithKeys("up", "k")),
-	Down:          key.NewBinding(key.WithKeys("down", "j")),
-	Left:          key.NewBinding(key.WithKeys("left", "h", "backspace")),
-	Right:         key.NewBinding(key.WithKeys("right", "l", "enter")),
-	GoHome:        key.NewBinding(key.WithKeys("~")),
-	ToggleHidden:  key.NewBinding(key.WithKeys("H")),
-	SwitchPane:    key.NewBinding(key.WithKeys("tab")),
-	OpenMenu:      key.NewBinding(key.WithKeys(".")),
-	Copy:          key.NewBinding(key.WithKeys("ctrl+c")),
-	Paste:         key.NewBinding(key.WithKeys("ctrl+v")),
-	Search:        key.NewBinding(key.WithKeys("f")),
-	ToggleDetails: key.NewBinding(key.WithKeys("d")),
-	Delete:        key.NewBinding(key.WithKeys("delete", "D")),
-	Quit:          key.NewBinding(key.WithKeys("q")),
+	Up:             key.NewBinding(key.WithKeys("up", "k")),
+	Down:           key.NewBinding(key.WithKeys("down", "j")),
+	Left:           key.NewBinding(key.WithKeys("left", "h", "backspace")),
+	Right:          key.NewBinding(key.WithKeys("right", "l", "enter")),
+	GoHome:         key.NewBinding(key.WithKeys("~")),
+	ToggleHidden:   key.NewBinding(key.WithKeys("H")),
+	SwitchPane:     key.NewBinding(key.WithKeys("tab")),
+	OpenMenu:       key.NewBinding(key.WithKeys(".")),
+	Copy:           key.NewBinding(key.WithKeys("ctrl+c")),
+	Paste:          key.NewBinding(key.WithKeys("ctrl+v")),
+	Search:         key.NewBinding(key.WithKeys("f")),
+	ToggleDetails:  key.NewBinding(key.WithKeys("d")),
+	Delete:         key.NewBinding(key.WithKeys("delete", "D")),
+	Quit:           key.NewBinding(key.WithKeys("q")),
+	ToggleFavorite: key.NewBinding(key.WithKeys("b")),
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +522,7 @@ type Model struct {
 	focus         focus
 	sidebarCursor int
 	bookmarks     []bookmark
+	favorites     []string // persisted favorite folder paths
 
 	clipboard      fileClipboard
 	contextMenu    contextMenuModel
@@ -553,6 +565,34 @@ func buildBookmarks() []bookmark {
 	return result
 }
 
+// isFavorite reports whether path is in the favorites list.
+func (m Model) isFavorite(path string) bool {
+	for _, f := range m.favorites {
+		if f == path {
+			return true
+		}
+	}
+	return false
+}
+
+// toggleFavorite adds or removes path from favorites and persists the change.
+func (m *Model) toggleFavorite(path string) {
+	if m.isFavorite(path) {
+		newFavs := m.favorites[:0]
+		for _, f := range m.favorites {
+			if f != path {
+				newFavs = append(newFavs, f)
+			}
+		}
+		m.favorites = newFavs
+	} else {
+		m.favorites = append(m.favorites, path)
+	}
+	cfg, _ := appconfig.Load()
+	cfg.Favorites = m.favorites
+	_ = appconfig.Save(cfg)
+}
+
 func New(startDir, selectName string) Model {
 	cfg, _ := appconfig.Load()
 	ApplyColors(cfg.Colors)
@@ -563,6 +603,7 @@ func New(startDir, selectName string) Model {
 		kittySupport: kitty.IsSupported(),
 		focus:        focusList,
 		bookmarks:    buildBookmarks(),
+		favorites:    cfg.Favorites,
 	}
 	m.entries, m.err = m.loadEntries()
 	if selectName != "" {
@@ -920,6 +961,18 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			m.statusMsg = fmt.Sprintf("image copied  %s", e.Name)
 		}
 
+	case menuFavoriteToggle:
+		e := m.entries[m.cursor]
+		if e.IsDir {
+			wasFav := m.isFavorite(e.Path)
+			m.toggleFavorite(e.Path)
+			if wasFav {
+				m.statusMsg = fmt.Sprintf("removed from favorites  %s", e.Name)
+			} else {
+				m.statusMsg = fmt.Sprintf("added to favorites  %s", e.Name)
+			}
+		}
+
 	case menuCancel:
 		// nothing
 	}
@@ -928,18 +981,25 @@ func (m Model) execMenuAction(item menuEntry) Model {
 }
 
 func (m Model) updateSidebar(msg tea.KeyMsg) Model {
+	total := len(m.bookmarks) + len(m.favorites)
 	switch {
 	case key.Matches(msg, keyMap.Up):
 		if m.sidebarCursor > 0 {
 			m.sidebarCursor--
 		}
 	case key.Matches(msg, keyMap.Down):
-		if m.sidebarCursor < len(m.bookmarks)-1 {
+		if m.sidebarCursor < total-1 {
 			m.sidebarCursor++
 		}
 	case key.Matches(msg, keyMap.Right):
-		if len(m.bookmarks) > 0 {
-			m.cwd = m.bookmarks[m.sidebarCursor].path
+		if total > 0 {
+			var targetPath string
+			if m.sidebarCursor < len(m.bookmarks) {
+				targetPath = m.bookmarks[m.sidebarCursor].path
+			} else {
+				targetPath = m.favorites[m.sidebarCursor-len(m.bookmarks)]
+			}
+			m.cwd = targetPath
 			m.cursor = 0
 			m.offset = 0
 			m.entries, m.err = m.loadEntries()
@@ -1175,6 +1235,20 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			ShowDetails: m.showDetails,
 			ShowHidden:  m.showHidden,
 		})
+
+	case key.Matches(msg, keyMap.ToggleFavorite):
+		if len(visible) > 0 {
+			e := visible[m.cursor]
+			if e.IsDir {
+				wasFav := m.isFavorite(e.Path)
+				m.toggleFavorite(e.Path)
+				if wasFav {
+					m.statusMsg = fmt.Sprintf("removed from favorites  %s", e.Name)
+				} else {
+					m.statusMsg = fmt.Sprintf("added to favorites  %s", e.Name)
+				}
+			}
+		}
 	}
 	return m, nil
 }
@@ -1367,8 +1441,9 @@ func (m Model) renderSidebar(height int) string {
 	innerW := sidebarWidth - 4
 
 	var rows []string
-	rows = append(rows, StyleSidebarLabel.Render("BOOKMARKS"))
 
+	// --- Bookmarks ---
+	rows = append(rows, StyleSidebarLabel.Render("BOOKMARKS"))
 	for i, b := range m.bookmarks {
 		label := fmt.Sprintf("%s %s", b.icon, b.label)
 		var style lipgloss.Style
@@ -1382,6 +1457,26 @@ func (m Model) renderSidebar(height int) string {
 			style = StyleSidebarItem
 		}
 		rows = append(rows, style.Width(innerW).Render(label))
+	}
+
+	// --- Favorites ---
+	if len(m.favorites) > 0 {
+		rows = append(rows, StyleSidebarLabel.Render("FAVORITES"))
+		for i, fav := range m.favorites {
+			sidebarIdx := len(m.bookmarks) + i
+			label := fmt.Sprintf("󰀼 %s", filepath.Base(fav))
+			var style lipgloss.Style
+			if sidebarIdx == m.sidebarCursor {
+				if m.focus == focusSidebar {
+					style = StyleSidebarCursor
+				} else {
+					style = StyleSidebarCursorInactive
+				}
+			} else {
+				style = StyleSidebarItem
+			}
+			rows = append(rows, style.Width(innerW).Render(label))
+		}
 	}
 
 	for len(rows) < height {

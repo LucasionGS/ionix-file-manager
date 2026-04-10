@@ -16,9 +16,10 @@ const appName = "ifm"
 
 // Config holds all persistent user preferences.
 type Config struct {
-	ShowDetails bool   `json:"show_details"`
-	ShowHidden  bool   `json:"show_hidden"`
-	Colors      Colors `json:"colors,omitempty"`
+	ShowDetails bool     `json:"show_details"`
+	ShowHidden  bool     `json:"show_hidden"`
+	Colors      Colors   `json:"colors,omitempty"`
+	Favorites   []string `json:"favorites,omitempty"`
 }
 
 // Colors holds optional hex color overrides for the UI.
