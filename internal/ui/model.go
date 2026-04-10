@@ -1,7 +1,11 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
+	"image"
+	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +20,8 @@ import (
 )
 
 const sidebarWidth = 22
+const detailsWidth = 30
+const previewCellRows = 11 // rows reserved in the details panel for image preview
 
 // ---------------------------------------------------------------------------
 // Focus
@@ -172,6 +178,76 @@ func filterAndSort(entries []appfs.Entry, query string) []appfs.Entry {
 }
 
 // ---------------------------------------------------------------------------
+// Image preview
+// ---------------------------------------------------------------------------
+
+type previewLoadedMsg struct {
+	path    string
+	encoded string // base64-encoded image, pre-computed in the background
+	imgW    int
+	imgH    int
+}
+
+// previewMaxPx is the longest edge (in pixels) we scale previews down to.
+// At typical 8×16px cells a 26-col×11-row panel is ~416×352px, so 512px
+// keeps quality while producing a PNG of only a few KB to write per render.
+const previewMaxPx = 512
+
+func loadPreviewCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return previewLoadedMsg{path: path}
+		}
+
+		// Decode to image.Image — handles PNG, JPEG, GIF (decoders registered in main).
+		img, _, err := image.Decode(bytes.NewReader(data))
+		if err != nil {
+			return previewLoadedMsg{path: path}
+		}
+
+		// Scale down to at most previewMaxPx on the longest edge.
+		// This keeps the terminal write tiny (~KB) on every render.
+		img = scaleDown(img, previewMaxPx, previewMaxPx)
+
+		// Re-encode as PNG — kitty's f=100 is PNG-specific.
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			return previewLoadedMsg{path: path}
+		}
+
+		b := img.Bounds()
+		return previewLoadedMsg{
+			path:    path,
+			encoded: kitty.Encode(buf.Bytes()),
+			imgW:    b.Dx(),
+			imgH:    b.Dy(),
+		}
+	}
+}
+
+// scaleDown resizes src so neither dimension exceeds maxW×maxH, preserving
+// aspect ratio. Returns src unchanged if it already fits.
+func scaleDown(src image.Image, maxW, maxH int) image.Image {
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	if srcW <= maxW && srcH <= maxH {
+		return src
+	}
+	scale := math.Min(float64(maxW)/float64(srcW), float64(maxH)/float64(srcH))
+	dstW := int(math.Round(float64(srcW) * scale))
+	dstH := int(math.Round(float64(srcH) * scale))
+
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	for y := range dstH {
+		for x := range dstW {
+			dst.Set(x, y, src.At(b.Min.X+int(float64(x)/scale), b.Min.Y+int(float64(y)/scale)))
+		}
+	}
+	return dst
+}
+
+// ---------------------------------------------------------------------------
 // Sidebar bookmarks
 // ---------------------------------------------------------------------------
 
@@ -194,20 +270,22 @@ var keyMap = struct {
 	Copy                  key.Binding
 	Paste                 key.Binding
 	Search                key.Binding
+	ToggleDetails         key.Binding
 	Quit                  key.Binding
 }{
-	Up:           key.NewBinding(key.WithKeys("up", "k")),
-	Down:         key.NewBinding(key.WithKeys("down", "j")),
-	Left:         key.NewBinding(key.WithKeys("left", "h", "backspace")),
-	Right:        key.NewBinding(key.WithKeys("right", "l", "enter")),
-	GoHome:       key.NewBinding(key.WithKeys("~")),
-	ToggleHidden: key.NewBinding(key.WithKeys("H")),
-	SwitchPane:   key.NewBinding(key.WithKeys("tab")),
-	OpenMenu:     key.NewBinding(key.WithKeys(".")),
-	Copy:         key.NewBinding(key.WithKeys("ctrl+c")),
-	Paste:        key.NewBinding(key.WithKeys("ctrl+v")),
-	Search:       key.NewBinding(key.WithKeys("f")),
-	Quit:         key.NewBinding(key.WithKeys("q")),
+	Up:            key.NewBinding(key.WithKeys("up", "k")),
+	Down:          key.NewBinding(key.WithKeys("down", "j")),
+	Left:          key.NewBinding(key.WithKeys("left", "h", "backspace")),
+	Right:         key.NewBinding(key.WithKeys("right", "l", "enter")),
+	GoHome:        key.NewBinding(key.WithKeys("~")),
+	ToggleHidden:  key.NewBinding(key.WithKeys("H")),
+	SwitchPane:    key.NewBinding(key.WithKeys("tab")),
+	OpenMenu:      key.NewBinding(key.WithKeys(".")),
+	Copy:          key.NewBinding(key.WithKeys("ctrl+c")),
+	Paste:         key.NewBinding(key.WithKeys("ctrl+v")),
+	Search:        key.NewBinding(key.WithKeys("f")),
+	ToggleDetails: key.NewBinding(key.WithKeys("d")),
+	Quit:          key.NewBinding(key.WithKeys("q")),
 }
 
 // ---------------------------------------------------------------------------
@@ -230,9 +308,14 @@ type Model struct {
 	sidebarCursor int
 	bookmarks     []bookmark
 
-	clipboard   fileClipboard
-	contextMenu contextMenuModel
-	search      searchModel
+	clipboard      fileClipboard
+	contextMenu    contextMenuModel
+	search         searchModel
+	showDetails    bool
+	previewPath    string
+	previewEncoded string // base64-encoded, ready for kitty.Place
+	previewW       int
+	previewH       int
 }
 
 func buildBookmarks() []bookmark {
@@ -291,6 +374,35 @@ func (m Model) loadEntries() ([]appfs.Entry, error) {
 	return filtered, nil
 }
 
+// fileListWidth returns the column width allocated to the file list pane.
+func (m Model) fileListWidth() int {
+	w := m.width - sidebarWidth
+	if m.showDetails {
+		w -= detailsWidth
+	}
+	return w
+}
+
+// maybeLoadPreview returns a Cmd to load the selected image when the details
+// panel is open and the selection has changed. Returns nil when not needed.
+func (m Model) maybeLoadPreview() tea.Cmd {
+	if !m.showDetails || !kitty.IsSupported() {
+		return nil
+	}
+	visible := m.visibleEntries()
+	if len(visible) == 0 || m.cursor >= len(visible) {
+		return nil
+	}
+	e := visible[m.cursor]
+	if e.IsDir || !appfs.IsImage(e.Name) {
+		return nil
+	}
+	if e.Path == m.previewPath {
+		return nil // already loaded
+	}
+	return loadPreviewCmd(e.Path)
+}
+
 // visibleEntries returns the entries to display: filtered+sorted when searching,
 // or all loaded entries otherwise.
 func (m Model) visibleEntries() []appfs.Entry {
@@ -311,6 +423,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		return m, m.maybeLoadPreview()
+
+	case previewLoadedMsg:
+		if msg.encoded != "" {
+			m.previewPath = msg.path
+			m.previewEncoded = msg.encoded
+			m.previewW = msg.imgW
+			m.previewH = msg.imgH
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -357,6 +478,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case key.Matches(msg, keyMap.ToggleDetails):
+			m.showDetails = !m.showDetails
+			if !m.showDetails {
+				m.previewPath = ""
+				m.previewEncoded = ""
+			}
+
 		case key.Matches(msg, keyMap.Search):
 			m.search.active = true
 			m.search.query = ""
@@ -396,7 +524,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	return m, nil
+	return m, m.maybeLoadPreview()
 }
 
 func (m Model) updateContextMenu(msg tea.KeyMsg) Model {
@@ -599,6 +727,8 @@ func (m Model) updateList(msg tea.KeyMsg) Model {
 			m.cursor = 0
 			m.offset = 0
 			m.search = searchModel{}
+			m.previewPath = ""
+			m.previewEncoded = ""
 			m.entries, m.err = m.loadEntries()
 		}
 
@@ -660,27 +790,37 @@ func (m Model) View() string {
 		return m.renderWithOverlay()
 	}
 
-	return m.renderNormal()
+	view := m.renderNormal()
+
+	if kitty.IsSupported() {
+		// Always clear stale images; redraw if we have preview data.
+		view += kitty.ClearAll()
+		if m.showDetails && m.previewEncoded != "" {
+			view += m.renderKittyPreview()
+		}
+	}
+
+	return view
 }
 
 func (m Model) renderNormal() string {
 	listH := m.listHeight()
-	listW := m.width - sidebarWidth - 1
+	listW := m.fileListWidth()
 
 	titleLine := StyleTitle.Render(" ionix ") +
 		StyleDim.Render(" › ") +
 		StyleNormal.Render(m.cwd)
 
-	body := lipgloss.JoinHorizontal(lipgloss.Top,
-		m.renderSidebar(listH),
-		m.renderFileList(listH, listW),
-	)
+	cols := []string{m.renderSidebar(listH), m.renderFileList(listH, listW)}
+	if m.showDetails {
+		cols = append(cols, m.renderDetails(listH))
+	}
+	body := lipgloss.JoinHorizontal(lipgloss.Top, cols...)
 
 	statusLine := StyleStatusBar.Width(m.width).Render(m.buildStatus())
 
 	if m.search.active {
-		searchBar := m.renderSearchBar()
-		return titleLine + "\n" + body + "\n" + searchBar + "\n" + statusLine
+		return titleLine + "\n" + body + "\n" + m.renderSearchBar() + "\n" + statusLine
 	}
 	return titleLine + "\n" + body + "\n" + statusLine
 }
@@ -789,6 +929,143 @@ func (m Model) renderFileList(height, width int) string {
 	return paneStyle.Width(width - 2).Height(height).Render(strings.Join(rows, "\n"))
 }
 
+// calcPreviewSize returns the cell (cols, rows) that preserve the image's
+// aspect ratio while fitting within (maxCols, maxRows).
+// cellAspect = cellWidth/cellHeight ≈ 0.5 for most terminal fonts.
+func calcPreviewSize(imgW, imgH, maxCols, maxRows int) (cols, rows int) {
+	if imgW <= 0 || imgH <= 0 {
+		return maxCols, maxRows
+	}
+	const cellAspect = 0.5
+	// Express the image aspect ratio in cell-unit space.
+	// One "cell unit" wide = cellAspect pixel-units tall.
+	imageAspectInCells := float64(imgW) / (float64(imgH) * cellAspect)
+	availAspect := float64(maxCols) / float64(maxRows)
+
+	if imageAspectInCells >= availAspect {
+		// Wider than the area → constrained by columns.
+		cols = maxCols
+		rows = int(math.Round(float64(maxCols) / imageAspectInCells))
+		if rows < 1 {
+			rows = 1
+		}
+	} else {
+		// Taller than the area → constrained by rows.
+		rows = maxRows
+		cols = int(math.Round(float64(maxRows) * imageAspectInCells))
+		if cols < 1 {
+			cols = 1
+		}
+	}
+	return
+}
+
+func (m Model) renderKittyPreview() string {
+	listW := m.fileListWidth()
+	// 1-based column: past sidebar + file-list panes, then past left border+padding of details pane.
+	col := sidebarWidth + listW + 3
+	row := 3 // title(1) + pane top border(1) + first content row(1)
+	maxCols := detailsWidth - 4
+	c, r := calcPreviewSize(m.previewW, m.previewH, maxCols, previewCellRows)
+	return kitty.Place(m.previewEncoded, col, row, c, r, 1)
+}
+
+func (m Model) renderDetails(height int) string {
+	innerW := detailsWidth - 4
+	var rows []string
+
+	visible := m.visibleEntries()
+	if len(visible) == 0 || m.cursor >= len(visible) {
+		for len(rows) < height {
+			rows = append(rows, "")
+		}
+		return StylePane.Width(detailsWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
+	}
+
+	e := visible[m.cursor]
+
+	// Reserve space for image preview at the top of the panel.
+	isImageFile := !e.IsDir && appfs.IsImage(e.Name) && kitty.IsSupported()
+	if isImageFile {
+		if m.previewEncoded == "" {
+			rows = append(rows, StyleDim.Render("loading…"))
+		}
+		for len(rows) < previewCellRows+1 {
+			rows = append(rows, "")
+		}
+	}
+
+	label := func(s string) string {
+		return StyleDetailsLabel.Render(s)
+	}
+	val := func(s string) string {
+		return StyleDetailsValue.MaxWidth(innerW).Render(s)
+	}
+
+	// Name
+	rows = append(rows, label("NAME"))
+	name := e.Name
+	if e.IsDir {
+		name = StyleDetailsValueDir.MaxWidth(innerW).Render(name + "/")
+	} else {
+		name = val(name)
+	}
+	rows = append(rows, name)
+	rows = append(rows, "")
+
+	// Type
+	rows = append(rows, label("TYPE"))
+	if e.IsDir {
+		rows = append(rows, val("directory"))
+	} else {
+		ext := strings.ToLower(filepath.Ext(e.Name))
+		if ext == "" {
+			ext = "file"
+		}
+		rows = append(rows, val(ext+" file"))
+	}
+	rows = append(rows, "")
+
+	// Size
+	if e.Info != nil {
+		rows = append(rows, label("SIZE"))
+		if e.IsDir {
+			rows = append(rows, val("—"))
+		} else {
+			rows = append(rows, val(formatSize(e.Info.Size())))
+		}
+		rows = append(rows, "")
+
+		// Modified
+		rows = append(rows, label("MODIFIED"))
+		rows = append(rows, val(e.Info.ModTime().Format("2006-01-02  15:04")))
+		rows = append(rows, "")
+
+		// Permissions
+		rows = append(rows, label("PERMISSIONS"))
+		rows = append(rows, val(e.Info.Mode().String()))
+	}
+
+	for len(rows) < height {
+		rows = append(rows, "")
+	}
+
+	return StylePane.Width(detailsWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
+}
+
+func formatSize(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
 func (m Model) renderSearchBar() string {
 	visible := m.visibleEntries()
 	count := fmt.Sprintf("  %d results", len(visible))
@@ -830,7 +1107,7 @@ func (m Model) buildStatus() string {
 	} else {
 		paneKeys += focusShortcutsMap[focusSidebar].Keys()[0]
 	}
-	
+
 	parts := []string{
 		fmt.Sprintf("%d/%d", pos, total),
 		". menu",

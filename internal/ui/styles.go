@@ -73,4 +73,15 @@ var (
 				Bold(true).
 				PaddingLeft(1).
 				MarginTop(1)
+
+	StyleDetailsLabel = lipgloss.NewStyle().
+				Foreground(colorDim).
+				Bold(true)
+
+	StyleDetailsValue = lipgloss.NewStyle().
+				Foreground(colorBase)
+
+	StyleDetailsValueDir = lipgloss.NewStyle().
+					Foreground(colorDir).
+					Bold(true)
 )

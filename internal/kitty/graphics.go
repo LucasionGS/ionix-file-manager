@@ -3,99 +3,62 @@
 package kitty
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
 )
 
-// IsSupported returns true if the current terminal is Kitty.
+// IsSupported returns true if the current terminal supports the kitty graphics protocol.
 func IsSupported() bool {
 	term := os.Getenv("TERM")
 	kittyPid := os.Getenv("KITTY_PID")
 	return strings.Contains(term, "kitty") || kittyPid != ""
 }
 
-// ClearImage removes a previously displayed image at the given placement ID.
-func ClearImage(placementID int) {
-	fmt.Printf("\x1b_Ga=d,d=i,i=%d;\x1b\\", placementID)
+// ClearAll returns the escape sequence that deletes every kitty image on screen.
+func ClearAll() string {
+	return "\033_Ga=d,d=A;\033\\"
 }
 
-// DisplayImageFile renders an image file using the kitty graphics protocol.
-// x, y are the cell coordinates; w, h are the max cell dimensions (0 = auto).
-func DisplayImageFile(path string, placementID, x, y, w, h int) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	return displayImageBytes(data, placementID, x, y, w, h)
+// Encode returns the base64 encoding of data, ready to pass to Place.
+// Call this once in a background goroutine; the result can be reused on every render.
+func Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
 }
 
-func displayImageBytes(data []byte, placementID, x, y, w, h int) error {
-	import64 := encodeBase64(data)
+// Place returns escape sequences that:
+//  1. Save the cursor position
+//  2. Move to (col, row) — both 1-based terminal coordinates
+//  3. Transmit and display encoded (base64) image data within cols×rows cells
+//  4. Restore the cursor position
+//
+// encoded must be the base64-encoded image bytes (from Encode).
+// id identifies the image for later deletion. f=100 lets kitty detect the
+// format automatically (PNG, JPEG, etc.).
+func Place(encoded string, col, row, cols, rows, id int) string {
+	opts := fmt.Sprintf("a=T,f=100,c=%d,r=%d,i=%d", cols, rows, id)
 
-	// Build placement options
-	opts := fmt.Sprintf("a=T,f=100,i=%d,p=%d", placementID, placementID)
-	if x > 0 {
-		opts += fmt.Sprintf(",X=%d", x)
-	}
-	if y > 0 {
-		opts += fmt.Sprintf(",Y=%d", y)
-	}
-	if w > 0 {
-		opts += fmt.Sprintf(",c=%d", w)
-	}
-	if h > 0 {
-		opts += fmt.Sprintf(",r=%d", h)
-	}
+	var sb strings.Builder
+	sb.WriteString("\033[s") // save cursor
+	sb.WriteString(fmt.Sprintf("\033[%d;%dH", row, col))
 
-	// Chunk the payload (max 4096 bytes per chunk per spec)
 	const chunkSize = 4096
-	for i := 0; i < len(import64); i += chunkSize {
+	for i := 0; i < len(encoded); i += chunkSize {
 		end := i + chunkSize
 		more := 1
-		if end >= len(import64) {
-			end = len(import64)
+		if end >= len(encoded) {
+			end = len(encoded)
 			more = 0
 		}
-		chunk := import64[i:end]
-
-		var payload string
+		chunk := encoded[i:end]
 		if i == 0 {
-			payload = fmt.Sprintf("\x1b_G%s,m=%d;%s\x1b\\", opts, more, chunk)
+			sb.WriteString(fmt.Sprintf("\033_G%s,m=%d;%s\033\\", opts, more, chunk))
 		} else {
-			payload = fmt.Sprintf("\x1b_Gm=%d;%s\x1b\\", more, chunk)
+			sb.WriteString(fmt.Sprintf("\033_Gm=%d;%s\033\\", more, chunk))
 		}
-		fmt.Print(payload)
 	}
 
-	return nil
-}
-
-func encodeBase64(data []byte) string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	var sb strings.Builder
-	for i := 0; i < len(data); i += 3 {
-		remaining := len(data) - i
-		b0 := data[i]
-		var b1, b2 byte
-		if remaining > 1 {
-			b1 = data[i+1]
-		}
-		if remaining > 2 {
-			b2 = data[i+2]
-		}
-		sb.WriteByte(chars[b0>>2])
-		sb.WriteByte(chars[(b0&0x3)<<4|b1>>4])
-		if remaining > 1 {
-			sb.WriteByte(chars[(b1&0xf)<<2|b2>>6])
-		} else {
-			sb.WriteByte('=')
-		}
-		if remaining > 2 {
-			sb.WriteByte(chars[b2&0x3f])
-		} else {
-			sb.WriteByte('=')
-		}
-	}
+	sb.WriteString("\033[u") // restore cursor
 	return sb.String()
 }

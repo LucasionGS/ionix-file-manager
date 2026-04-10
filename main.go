@@ -5,7 +5,10 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/ion/ionix-file-manager/internal/ui"
+	_ "image/gif"
+	_ "image/jpeg"
+
+"github.com/ion/ionix-file-manager/internal/ui"
 )
 
 func main() {
