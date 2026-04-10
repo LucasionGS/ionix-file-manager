@@ -1461,6 +1461,7 @@ func (m Model) renderSidebar(height int) string {
 
 	// --- Favorites ---
 	if len(m.favorites) > 0 {
+		rows = append(rows, "") // spacer between sections
 		rows = append(rows, StyleSidebarLabel.Render("FAVORITES"))
 		for i, fav := range m.favorites {
 			sidebarIdx := len(m.bookmarks) + i
@@ -1482,6 +1483,7 @@ func (m Model) renderSidebar(height int) string {
 	for len(rows) < height {
 		rows = append(rows, "")
 	}
+	rows = rows[:height]
 
 	paneStyle := StylePane
 	if m.focus == focusSidebar {

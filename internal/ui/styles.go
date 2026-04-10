@@ -134,8 +134,7 @@ func ApplyColors(c appconfig.Colors) {
 	StyleSidebarLabel = lipgloss.NewStyle().
 		Foreground(colorDim).
 		Bold(true).
-		PaddingLeft(1).
-		MarginTop(1)
+		PaddingLeft(1)
 
 	StyleDetailsLabel = lipgloss.NewStyle().
 		Foreground(colorDim).
