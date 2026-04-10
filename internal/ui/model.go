@@ -150,6 +150,15 @@ type deleteModal struct {
 }
 
 // ---------------------------------------------------------------------------
+// Go-to path modal
+// ---------------------------------------------------------------------------
+
+type goToModal struct {
+	open  bool
+	query string
+}
+
+// ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
 
@@ -489,6 +498,7 @@ var keyMap = struct {
 	ToggleFavorite        key.Binding
 	CyclePanes            key.Binding
 	ToggleSplit           key.Binding
+	GoTo                  key.Binding
 }{
 	Up:             key.NewBinding(key.WithKeys("up", "k")),
 	Down:           key.NewBinding(key.WithKeys("down", "j")),
@@ -507,6 +517,7 @@ var keyMap = struct {
 	ToggleFavorite: key.NewBinding(key.WithKeys("b")),
 	CyclePanes:     key.NewBinding(key.WithKeys("e")),
 	ToggleSplit:    key.NewBinding(key.WithKeys("s")),
+	GoTo:           key.NewBinding(key.WithKeys(":")),
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +544,7 @@ type Model struct {
 	clipboard      fileClipboard
 	contextMenu    contextMenuModel
 	deleteConfirm  deleteModal
+	goTo           goToModal
 	imageModal     imageModalState
 	search         searchModel
 	showDetails    bool
@@ -841,6 +853,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.maybeLoadPreview()
 		}
 
+		// Go-to path modal captures all input while open.
+		if m.goTo.open {
+			var cmd tea.Cmd
+			m, cmd = m.updateGoToModal(msg)
+			return m, cmd
+		}
+
 		// Search captures most input while active.
 		if m.search.active {
 			var searchCmd tea.Cmd
@@ -935,6 +954,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				m.focus = focusList
+			}
+
+		case key.Matches(msg, keyMap.GoTo):
+			if m.focus != focusSidebar {
+				m.goTo = goToModal{open: true, query: m.activeCwd()}
 			}
 
 		case key.Matches(msg, keyMap.ToggleSplit):
@@ -1134,6 +1158,47 @@ func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 		m.deleteConfirm = deleteModal{}
 	}
 	return m
+}
+
+func (m Model) updateGoToModal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		target := filepath.Clean(m.goTo.query)
+		m.goTo = goToModal{}
+		info, err := os.Stat(target)
+		if err != nil || !info.IsDir() {
+			m.statusMsg = fmt.Sprintf("invalid path: %s", target)
+			break
+		}
+		if m.focus == focusSplit {
+			m.cwd2 = target
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+		} else {
+			m.cwd = target
+			m.cursor = 0
+			m.offset = 0
+			m.entries, m.err = m.loadEntries()
+		}
+		return m, m.maybeLoadPreview()
+
+	case tea.KeyEsc:
+		m.goTo = goToModal{}
+
+	case tea.KeyBackspace:
+		runes := []rune(m.goTo.query)
+		if len(runes) > 0 {
+			m.goTo.query = string(runes[:len(runes)-1])
+		}
+
+	case tea.KeyRunes:
+		m.goTo.query += string(msg.Runes)
+
+	case tea.KeySpace:
+		m.goTo.query += " "
+	}
+	return m, nil
 }
 
 func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -1494,6 +1559,10 @@ func (m Model) View() string {
 		return m.renderDeleteModal()
 	}
 
+	if m.goTo.open {
+		return m.renderGoToModal()
+	}
+
 	if m.imageModal.open {
 		return m.renderImageModal()
 	}
@@ -1622,6 +1691,21 @@ func (m Model) renderDeleteModal() string {
 		StyleDim.Render("any other key") + StyleNormal.Render(" cancel")
 
 	content := strings.Join([]string{"", warning, nameLine, "", confirm, ""}, "\n")
+	box := StylePaneActive.Width(modalW).Render(content)
+	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m Model) renderGoToModal() string {
+	clear := ""
+	if kitty.IsSupported() {
+		clear = kitty.ClearAll()
+	}
+
+	const modalW = 60
+	label := StyleDim.Render("Go to path:")
+	input := StyleNormal.Render(m.goTo.query) + StyleCursor.Render(" ")
+	hint := StyleDim.Render("enter  confirm   esc  cancel")
+	content := strings.Join([]string{"", label, input, "", hint, ""}, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
 	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
@@ -1939,6 +2023,7 @@ func (m Model) buildStatus() string {
 		"[e] Panes",
 		"[s] Split",
 		"[H] Hidden",
+		"[:] Go to",
 		"[q] Quit",
 	}
 
