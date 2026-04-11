@@ -1,9 +1,11 @@
 package fs
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // CopyEntry copies a file or directory (recursively) from src to dst.
@@ -73,13 +75,113 @@ func MkdirEntry(path string) error {
 	return os.MkdirAll(path, 0755)
 }
 
-// CreateFileEntry creates a new empty file at path.
+// CreateFileEntry creates a new empty file at path (like touch — no-op if already exists).
 func CreateFileEntry(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	return f.Close()
+}
+
+// ExpandBraces expands a bash-style brace expression into all matching strings.
+// e.g. "a/{b,c}/{1,2}" → ["a/b/1", "a/b/2", "a/c/1", "a/c/2"]
+// Returns an error for unmatched braces, empty alternatives, or path traversal.
+func ExpandBraces(pattern string) ([]string, error) {
+	// Reject path traversal.
+	for _, seg := range strings.Split(pattern, "/") {
+		clean := strings.Trim(seg, " ")
+		if clean == ".." || clean == "." {
+			return nil, fmt.Errorf("path traversal not allowed: %q", seg)
+		}
+	}
+	// Reject absolute paths.
+	if strings.HasPrefix(pattern, "/") {
+		return nil, fmt.Errorf("pattern must be relative, not absolute")
+	}
+	// Validate brace matching.
+	depth := 0
+	for i, c := range pattern {
+		switch c {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth < 0 {
+				return nil, fmt.Errorf("unexpected '}' at position %d", i)
+			}
+		}
+	}
+	if depth != 0 {
+		return nil, fmt.Errorf("unclosed '{' in pattern")
+	}
+	return expandBraces(pattern)
+}
+
+// expandBraces is the internal recursive expander (no validation).
+func expandBraces(pattern string) ([]string, error) {
+	start := -1
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '{' {
+			start = i
+			break
+		}
+	}
+	if start == -1 {
+		return []string{pattern}, nil
+	}
+	depth, end := 0, -1
+	for i := start; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end != -1 {
+			break
+		}
+	}
+	prefix := pattern[:start]
+	suffix := pattern[end+1:]
+	alts := splitBraceAlts(pattern[start+1 : end])
+	for _, alt := range alts {
+		if strings.TrimSpace(alt) == "" {
+			return nil, fmt.Errorf("empty alternative in braces %q", pattern[start:end+1])
+		}
+	}
+	var result []string
+	for _, alt := range alts {
+		expanded, err := expandBraces(prefix + alt + suffix)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, expanded...)
+	}
+	return result, nil
+}
+
+// splitBraceAlts splits s by top-level commas (not inside nested braces).
+func splitBraceAlts(s string) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, s[start:])
 }
 
 // DeleteEntry removes a file or directory (recursively).

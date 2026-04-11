@@ -178,6 +178,7 @@ type newItemModal struct {
 	open  bool
 	kind  newItemKind
 	query string
+	err   string // parse/validation error shown inline
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +717,7 @@ func (m *Model) maybeLoadPreview() tea.Cmd {
 	}
 	visible := m.activeVisible()
 	cursor := m.activeCursor()
-	if len(visible) == 0 || cursor >= len(visible) {
+	if len(visible) == 0 || cursor < 0 || cursor >= len(visible) {
 		return nil
 	}
 	e := visible[cursor]
@@ -1346,43 +1347,80 @@ func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 func (m Model) updateNewItemModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter:
-		name := strings.TrimSpace(m.newItem.query)
-		kind := m.newItem.kind
-		m.newItem = newItemModal{}
-		if name == "" {
+		pattern := strings.TrimSpace(m.newItem.query)
+		if pattern == "" {
+			m.newItem = newItemModal{}
 			break
 		}
-		target := filepath.Join(m.activeCwd(), name)
-		var err error
-		if kind == newItemDir {
-			err = appfs.MkdirEntry(target)
-		} else {
-			err = appfs.CreateFileEntry(target)
+		kind := m.newItem.kind
+		paths, parseErr := appfs.ExpandBraces(pattern)
+		if parseErr != nil {
+			m.newItem.err = parseErr.Error()
+			return m, nil
 		}
-		if err != nil {
-			m.statusMsg = fmt.Sprintf("error: %v", err)
+		m.newItem = newItemModal{}
+		base := m.activeCwd()
+		var firstCreated string
+		created, errCount := 0, 0
+		var lastErr error
+		for _, p := range paths {
+			target := filepath.Join(base, p)
+			var err error
+			if kind == newItemDir {
+				err = appfs.MkdirEntry(target)
+			} else {
+				if dirErr := appfs.MkdirEntry(filepath.Dir(target)); dirErr != nil {
+					err = dirErr
+				} else {
+					err = appfs.CreateFileEntry(target)
+				}
+			}
+			if err != nil {
+				errCount++
+				lastErr = err
+			} else {
+				created++
+				if firstCreated == "" {
+					firstCreated = filepath.Base(p)
+				}
+			}
+		}
+		if created == 0 {
+			m.statusMsg = fmt.Sprintf("error: %v", lastErr)
 		} else {
 			if m.focus == focusSplit {
 				m.entries2, _ = m.loadEntries2()
+				if m.cursor2 < 0 || m.cursor2 >= len(m.entries2) {
+					m.cursor2 = 0
+				}
 			} else {
 				m.entries, m.err = m.loadEntries()
-			}
-			// Move cursor to the newly created entry.
-			active := m.activeVisible()
-			for i, e := range active {
-				if e.Name == name {
-					if m.focus == focusSplit {
-						m.cursor2 = i
-					} else {
-						m.cursor = i
-					}
-					break
+				if m.cursor < 0 || m.cursor >= len(m.entries) {
+					m.cursor = 0
 				}
 			}
-			if kind == newItemDir {
-				m.statusMsg = fmt.Sprintf("created  %s/", name)
-			} else {
-				m.statusMsg = fmt.Sprintf("created  %s", name)
+			if firstCreated != "" {
+				active := m.activeVisible()
+				for i, e := range active {
+					if e.Name == firstCreated {
+						if m.focus == focusSplit {
+							m.cursor2 = i
+						} else {
+							m.cursor = i
+						}
+						break
+					}
+				}
+			}
+			switch {
+			case errCount > 0:
+				m.statusMsg = fmt.Sprintf("created  %d   %d failed", created, errCount)
+			case created == 1 && kind == newItemDir:
+				m.statusMsg = fmt.Sprintf("created  %s/", firstCreated)
+			case created == 1:
+				m.statusMsg = fmt.Sprintf("created  %s", firstCreated)
+			default:
+				m.statusMsg = fmt.Sprintf("created  %d items", created)
 			}
 		}
 		return m, m.maybeLoadPreview()
@@ -2045,7 +2083,13 @@ func (m Model) renderNewItemModal() string {
 	}
 	input := StyleNormal.Render(m.newItem.query) + StyleCursor.Render(" ")
 	hint := StyleDim.Render("enter  confirm   esc  cancel")
-	content := strings.Join([]string{"", label, input, "", hint, ""}, "\n")
+	var lines []string
+	lines = append(lines, "", label, input, "")
+	if m.newItem.err != "" {
+		lines = append(lines, StyleSelected.Render("  "+m.newItem.err))
+	}
+	lines = append(lines, hint, "")
+	content := strings.Join(lines, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
 	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
