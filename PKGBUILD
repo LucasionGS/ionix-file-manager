@@ -2,7 +2,7 @@
 pkgname=ionix-file-manager-git
 pkgver=r0.0000000
 pkgrel=1
-pkgdesc="A terminal file manager with Kitty graphics protocol support"
+pkgdesc="A keyboard-focused terminal file manager with Kitty graphics protocol support"
 arch=('x86_64' 'aarch64' 'armv7h')
 url="https://github.com/LucasionGS/ionix-file-manager"
 license=('MIT')
