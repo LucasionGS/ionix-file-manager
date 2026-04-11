@@ -930,22 +930,22 @@ type Model struct {
 	bookmarks     []bookmark
 	favorites     []string // persisted favorite folder paths
 
-	clipboard      fileClipboard
-	contextMenu    contextMenuModel
-	deleteConfirm  deleteModal
-	goTo           goToModal
-	newItem        newItemModal
-	palette        paletteModel
-	imageModal     imageModalState
-	search         searchModel
-	showDetails    bool
-	previewPath    string
-	previewEncoded string // base64-encoded, ready for kitty.Place
-	previewW       int
-	previewH       int
-	previewCache   map[string]imageModalCacheEntry // reuses imageModalCacheEntry: encoded+dims
-	pendingSelect    string // filename to select on first WindowSizeMsg
-	pendingOpenImage bool   // open image modal on first WindowSizeMsg
+	clipboard        fileClipboard
+	contextMenu      contextMenuModel
+	deleteConfirm    deleteModal
+	goTo             goToModal
+	newItem          newItemModal
+	palette          paletteModel
+	imageModal       imageModalState
+	search           searchModel
+	showDetails      bool
+	previewPath      string
+	previewEncoded   string // base64-encoded, ready for kitty.Place
+	previewW         int
+	previewH         int
+	previewCache     map[string]imageModalCacheEntry // reuses imageModalCacheEntry: encoded+dims
+	pendingSelect    string                          // filename to select on first WindowSizeMsg
+	pendingOpenImage bool                            // open image modal on first WindowSizeMsg
 
 	showSplit bool
 	cwd2      string
