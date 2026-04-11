@@ -89,6 +89,7 @@ const (
 	menuCopyImage
 	menuFavoriteToggle
 	menuExtract
+	menuRename
 	menuCancel
 )
 
@@ -214,6 +215,10 @@ func (m *Model) buildMenu() []menuEntry {
 		}
 	}
 
+	if hasSelection {
+		items = append(items, menuEntry{icon: "󰐅", label: "Rename", action: menuRename})
+	}
+
 	items = append(items, menuEntry{icon: "󰜺", label: "Cancel", action: menuCancel})
 	return items
 }
@@ -221,6 +226,17 @@ func (m *Model) buildMenu() []menuEntry {
 type contextMenuModel struct {
 	open   bool
 	cursor int
+}
+
+// ---------------------------------------------------------------------------
+// Rename modal
+// ---------------------------------------------------------------------------
+
+type renameModal struct {
+	open   bool
+	target appfs.Entry
+	query  string
+	err    string
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1191,7 @@ var keyMap = struct {
 	MarkSelectRange       key.Binding
 	NewDir                key.Binding
 	NewFile               key.Binding
+	Rename                key.Binding
 	Palette               key.Binding
 }{
 	Up:              key.NewBinding(key.WithKeys("up", "k")),
@@ -1199,6 +1216,7 @@ var keyMap = struct {
 	MarkSelectRange: key.NewBinding(key.WithKeys("V")),
 	NewDir:          key.NewBinding(key.WithKeys("n")),
 	NewFile:         key.NewBinding(key.WithKeys("N")),
+	Rename:          key.NewBinding(key.WithKeys("f2")),
 	Palette:         key.NewBinding(key.WithKeys("f1")),
 }
 
@@ -1231,6 +1249,7 @@ type Model struct {
 	palette          paletteModel
 	imageModal       imageModalState
 	audioPlayer      audioModal
+	renameModal      renameModal
 	search           searchModel
 	showDetails      bool
 	previewPath      string
@@ -1636,6 +1655,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// Rename modal captures all input while open.
+		if m.renameModal.open {
+			var cmd tea.Cmd
+			m, cmd = m.updateRenameModal(msg)
+			return m, cmd
+		}
+
 		// Command palette captures all input while open.
 		if m.palette.open {
 			var cmd tea.Cmd
@@ -1803,6 +1829,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.focus != focusSidebar {
 				m.newItem = newItemModal{open: true, kind: newItemFile}
 				m.statusMsg = ""
+			}
+
+		case key.Matches(msg, keyMap.Rename):
+			if m.focus != focusSidebar {
+				active := m.activeVisible()
+				cursor := m.activeCursor()
+				if len(active) > 0 && cursor >= 0 && cursor < len(active) {
+					e := active[cursor]
+					m.renameModal = renameModal{open: true, target: e, query: e.Name}
+					m.statusMsg = ""
+				}
 			}
 
 		case key.Matches(msg, keyMap.Palette):
@@ -2012,6 +2049,11 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			}
 		}
 
+	case menuRename:
+		e := active[cursor]
+		m.renameModal = renameModal{open: true, target: e, query: e.Name}
+		m.statusMsg = ""
+
 	case menuCancel:
 		// nothing
 	}
@@ -2094,6 +2136,74 @@ func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 		m.deleteConfirm = deleteModal{}
 	}
 	return m
+}
+
+func (m Model) updateRenameModal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		newName := strings.TrimSpace(m.renameModal.query)
+		if newName == "" || newName == m.renameModal.target.Name {
+			m.renameModal = renameModal{}
+			break
+		}
+		old := m.renameModal.target.Path
+		newPath := filepath.Join(filepath.Dir(old), newName)
+		m.renameModal = renameModal{}
+		if err := appfs.MoveEntry(old, newPath); err != nil {
+			m.statusMsg = fmt.Sprintf("rename error: %v", err)
+		} else {
+			m.statusMsg = fmt.Sprintf("renamed  %s", newName)
+			if m.focus == focusSplit {
+				m.entries2, _ = m.loadEntries2()
+				for i, e := range m.entries2 {
+					if e.Path == newPath {
+						m.cursor2 = i
+						break
+					}
+				}
+			} else {
+				m.entries, _ = m.loadEntries()
+				for i, e := range m.entries {
+					if e.Path == newPath {
+						m.cursor = i
+						break
+					}
+				}
+			}
+		}
+		return m, m.maybeLoadPreview()
+
+	case tea.KeyEsc:
+		m.renameModal = renameModal{}
+
+	case tea.KeyBackspace:
+		runes := []rune(m.renameModal.query)
+		if len(runes) > 0 {
+			m.renameModal.query = string(runes[:len(runes)-1])
+		}
+
+	case tea.KeyRunes:
+		m.renameModal.query += string(msg.Runes)
+
+	case tea.KeySpace:
+		m.renameModal.query += " "
+	}
+	return m, nil
+}
+
+func (m Model) renderRenameModal() string {
+	const modalW = 54
+	label := StyleDim.Render("Rename " + m.renameModal.target.Name + ":")
+	input := StyleNormal.Render(m.renameModal.query) + StyleCursor.Render(" ")
+	hint := StyleDim.Render("enter  confirm   esc  cancel")
+	var lines []string
+	lines = append(lines, "", label, input, "")
+	if m.renameModal.err != "" {
+		lines = append(lines, StyleSelected.Render("  "+m.renameModal.err))
+	}
+	lines = append(lines, hint, "")
+	box := StylePaneActive.Width(modalW).Render(strings.Join(lines, "\n"))
+	return m.overlayModal(box)
 }
 
 func (m Model) updateNewItemModal(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -2911,6 +3021,10 @@ func (m Model) View() string {
 
 	if m.newItem.open {
 		return m.renderNewItemModal()
+	}
+
+	if m.renameModal.open {
+		return m.renderRenameModal()
 	}
 
 	if m.palette.open {
