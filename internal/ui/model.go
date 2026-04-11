@@ -60,10 +60,14 @@ const (
 	clipCut
 )
 
-type fileClipboard struct {
-	op   clipOp
+type clipItem struct {
 	path string
 	name string
+}
+
+type fileClipboard struct {
+	op    clipOp
+	items []clipItem
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +115,7 @@ func (m *Model) buildMenu() []menuEntry {
 		)
 	}
 
-	if m.clipboard.op != clipNone {
+	if m.clipboard.op != clipNone && len(m.clipboard.items) > 0 {
 		items = append(items, menuEntry{icon: "󰆒", label: "Paste", action: menuPaste})
 	}
 
@@ -145,8 +149,9 @@ type contextMenuModel struct {
 // ---------------------------------------------------------------------------
 
 type deleteModal struct {
-	open   bool
-	target appfs.Entry // entry to be deleted
+	open         bool
+	target       appfs.Entry   // primary entry (for display)
+	multiTargets []appfs.Entry // all targets when multiple selected
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +160,23 @@ type deleteModal struct {
 
 type goToModal struct {
 	open  bool
+	query string
+}
+
+// ---------------------------------------------------------------------------
+// New item modal
+// ---------------------------------------------------------------------------
+
+type newItemKind int
+
+const (
+	newItemDir newItemKind = iota
+	newItemFile
+)
+
+type newItemModal struct {
+	open  bool
+	kind  newItemKind
 	query string
 }
 
@@ -499,25 +521,33 @@ var keyMap = struct {
 	CyclePanes            key.Binding
 	ToggleSplit           key.Binding
 	GoTo                  key.Binding
+	MarkSelect            key.Binding
+	MarkSelectRange       key.Binding
+	NewDir                key.Binding
+	NewFile               key.Binding
 }{
-	Up:             key.NewBinding(key.WithKeys("up", "k")),
-	Down:           key.NewBinding(key.WithKeys("down", "j")),
-	Left:           key.NewBinding(key.WithKeys("left", "h", "backspace")),
-	Right:          key.NewBinding(key.WithKeys("right", "l", "enter")),
-	GoHome:         key.NewBinding(key.WithKeys("~")),
-	ToggleHidden:   key.NewBinding(key.WithKeys("H")),
-	SwitchPane:     key.NewBinding(key.WithKeys("tab")),
-	OpenMenu:       key.NewBinding(key.WithKeys(".")),
-	Copy:           key.NewBinding(key.WithKeys("ctrl+c")),
-	Paste:          key.NewBinding(key.WithKeys("ctrl+v")),
-	Search:         key.NewBinding(key.WithKeys("f")),
-	ToggleDetails:  key.NewBinding(key.WithKeys("d")),
-	Delete:         key.NewBinding(key.WithKeys("delete", "D")),
-	Quit:           key.NewBinding(key.WithKeys("q")),
-	ToggleFavorite: key.NewBinding(key.WithKeys("b")),
-	CyclePanes:     key.NewBinding(key.WithKeys("e")),
-	ToggleSplit:    key.NewBinding(key.WithKeys("s")),
-	GoTo:           key.NewBinding(key.WithKeys(":")),
+	Up:              key.NewBinding(key.WithKeys("up", "k")),
+	Down:            key.NewBinding(key.WithKeys("down", "j")),
+	Left:            key.NewBinding(key.WithKeys("left", "h", "backspace")),
+	Right:           key.NewBinding(key.WithKeys("right", "l", "enter")),
+	GoHome:          key.NewBinding(key.WithKeys("~")),
+	ToggleHidden:    key.NewBinding(key.WithKeys("H")),
+	SwitchPane:      key.NewBinding(key.WithKeys("tab")),
+	OpenMenu:        key.NewBinding(key.WithKeys(".")),
+	Copy:            key.NewBinding(key.WithKeys("ctrl+c")),
+	Paste:           key.NewBinding(key.WithKeys("ctrl+v")),
+	Search:          key.NewBinding(key.WithKeys("f")),
+	ToggleDetails:   key.NewBinding(key.WithKeys("d")),
+	Delete:          key.NewBinding(key.WithKeys("delete", "D")),
+	Quit:            key.NewBinding(key.WithKeys("q")),
+	ToggleFavorite:  key.NewBinding(key.WithKeys("b")),
+	CyclePanes:      key.NewBinding(key.WithKeys("e")),
+	ToggleSplit:     key.NewBinding(key.WithKeys("s")),
+	GoTo:            key.NewBinding(key.WithKeys(":")),
+	MarkSelect:      key.NewBinding(key.WithKeys(" ")),
+	MarkSelectRange: key.NewBinding(key.WithKeys("V")),
+	NewDir:          key.NewBinding(key.WithKeys("n")),
+	NewFile:         key.NewBinding(key.WithKeys("N")),
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +575,7 @@ type Model struct {
 	contextMenu    contextMenuModel
 	deleteConfirm  deleteModal
 	goTo           goToModal
+	newItem        newItemModal
 	imageModal     imageModalState
 	search         searchModel
 	showDetails    bool
@@ -560,6 +591,11 @@ type Model struct {
 	entries2  []appfs.Entry
 	cursor2   int
 	offset2   int
+
+	selectedPaths     map[string]bool
+	lastSelectedPath  string
+	selected2Paths    map[string]bool
+	lastSelected2Path string
 }
 
 func buildBookmarks() []bookmark {
@@ -740,6 +776,13 @@ func (m Model) activeCwd() string {
 	return m.cwd
 }
 
+func (m Model) activeSelectedPaths() map[string]bool {
+	if m.focus == focusSplit {
+		return m.selected2Paths
+	}
+	return m.selectedPaths
+}
+
 // loadEntries2 loads and filters directory entries for the second pane.
 func (m Model) loadEntries2() ([]appfs.Entry, error) {
 	all, err := appfs.List(m.cwd2)
@@ -860,6 +903,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// New item modal captures all input while open.
+		if m.newItem.open {
+			var cmd tea.Cmd
+			m, cmd = m.updateNewItemModal(msg)
+			return m, cmd
+		}
+
 		// Search captures most input while active.
 		if m.search.active {
 			var searchCmd tea.Cmd
@@ -872,37 +922,72 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch {
 		case key.Matches(msg, keyMap.Quit):
+			if len(m.selectedPaths) > 0 || len(m.selected2Paths) > 0 {
+				m.selectedPaths = nil
+				m.selected2Paths = nil
+				m.lastSelectedPath = ""
+				m.lastSelected2Path = ""
+				return m, nil
+			}
 			return m, tea.Quit
 
 		case key.Matches(msg, keyMap.Copy):
 			av := m.activeVisible()
 			if len(av) > 0 {
-				e := av[m.activeCursor()]
-				m.clipboard = fileClipboard{op: clipCopy, path: e.Path, name: e.Name}
-				m.statusMsg = fmt.Sprintf("copied  %s", e.Name)
+				sel := m.activeSelectedPaths()
+				var items []clipItem
+				if len(sel) > 0 {
+					for _, e := range av {
+						if sel[e.Path] {
+							items = append(items, clipItem{path: e.Path, name: e.Name})
+						}
+					}
+				}
+				if len(items) == 0 {
+					e := av[m.activeCursor()]
+					items = []clipItem{{path: e.Path, name: e.Name}}
+				}
+				m.clipboard = fileClipboard{op: clipCopy, items: items}
+				if len(items) == 1 {
+					m.statusMsg = fmt.Sprintf("copied  %s", items[0].name)
+				} else {
+					m.statusMsg = fmt.Sprintf("copied  %d items", len(items))
+				}
 			}
 
 		case key.Matches(msg, keyMap.Paste):
-			if m.clipboard.op != clipNone {
-				dst := filepath.Join(m.activeCwd(), m.clipboard.name)
-				var err error
-				if m.clipboard.op == clipCopy {
-					err = appfs.CopyEntry(m.clipboard.path, dst)
-				} else {
-					err = appfs.MoveEntry(m.clipboard.path, dst)
-					if err == nil {
-						m.clipboard = fileClipboard{}
+			if m.clipboard.op != clipNone && len(m.clipboard.items) > 0 {
+				var lastErr error
+				pasteCount := len(m.clipboard.items)
+				var lastName string
+				for _, item := range m.clipboard.items {
+					dst := filepath.Join(m.activeCwd(), item.name)
+					var err error
+					if m.clipboard.op == clipCopy {
+						err = appfs.CopyEntry(item.path, dst)
+					} else {
+						err = appfs.MoveEntry(item.path, dst)
+					}
+					if err != nil {
+						lastErr = err
+					} else {
+						lastName = item.name
 					}
 				}
-				if err != nil {
-					m.statusMsg = fmt.Sprintf("error: %v", err)
+				if m.clipboard.op == clipCut {
+					m.clipboard = fileClipboard{}
+				}
+				if lastErr != nil {
+					m.statusMsg = fmt.Sprintf("error: %v", lastErr)
+				} else if pasteCount == 1 {
+					m.statusMsg = fmt.Sprintf("pasted  %s", lastName)
 				} else {
-					m.statusMsg = fmt.Sprintf("pasted  %s", m.clipboard.name)
-					if m.focus == focusSplit {
-						m.entries2, _ = m.loadEntries2()
-					} else {
-						m.entries, _ = m.loadEntries()
-					}
+					m.statusMsg = fmt.Sprintf("pasted  %d items", pasteCount)
+				}
+				if m.focus == focusSplit {
+					m.entries2, _ = m.loadEntries2()
+				} else {
+					m.entries, _ = m.loadEntries()
 				}
 			}
 
@@ -929,7 +1014,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keyMap.Delete):
 			visible := m.activeVisible()
 			if m.focus != focusSidebar && len(visible) > 0 {
-				m.deleteConfirm = deleteModal{open: true, target: visible[m.activeCursor()]}
+				sel := m.activeSelectedPaths()
+				if len(sel) > 0 {
+					var targets []appfs.Entry
+					for _, e := range visible {
+						if sel[e.Path] {
+							targets = append(targets, e)
+						}
+					}
+					if len(targets) > 0 {
+						m.deleteConfirm = deleteModal{open: true, target: targets[0], multiTargets: targets}
+					}
+				} else {
+					m.deleteConfirm = deleteModal{open: true, target: visible[m.activeCursor()]}
+				}
 				m.statusMsg = ""
 			}
 
@@ -961,6 +1059,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.goTo = goToModal{open: true, query: m.activeCwd()}
 			}
 
+		case key.Matches(msg, keyMap.NewDir):
+			if m.focus != focusSidebar {
+				m.newItem = newItemModal{open: true, kind: newItemDir}
+				m.statusMsg = ""
+			}
+
+		case key.Matches(msg, keyMap.NewFile):
+			if m.focus != focusSidebar {
+				m.newItem = newItemModal{open: true, kind: newItemFile}
+				m.statusMsg = ""
+			}
+
 		case key.Matches(msg, keyMap.ToggleSplit):
 			if m.showSplit {
 				m.showSplit = false
@@ -974,6 +1084,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.offset2 = 0
 				m.entries2, _ = m.loadEntries2()
 				m.focus = focusSplit
+			}
+
+		case msg.Type == tea.KeyEsc:
+			if len(m.selectedPaths) > 0 || len(m.selected2Paths) > 0 {
+				m.selectedPaths = nil
+				m.selected2Paths = nil
+				m.lastSelectedPath = ""
+				m.lastSelected2Path = ""
 			}
 
 		default:
@@ -1035,30 +1153,76 @@ func (m Model) execMenuAction(item menuEntry) Model {
 
 	switch item.action {
 	case menuCopy:
-		e := active[cursor]
-		m.clipboard = fileClipboard{op: clipCopy, path: e.Path, name: e.Name}
-		m.statusMsg = fmt.Sprintf("copied  %s", e.Name)
-
-	case menuCut:
-		e := active[cursor]
-		m.clipboard = fileClipboard{op: clipCut, path: e.Path, name: e.Name}
-		m.statusMsg = fmt.Sprintf("cut  %s", e.Name)
-
-	case menuPaste:
-		dst := filepath.Join(m.activeCwd(), m.clipboard.name)
-		var err error
-		if m.clipboard.op == clipCopy {
-			err = appfs.CopyEntry(m.clipboard.path, dst)
-		} else {
-			err = appfs.MoveEntry(m.clipboard.path, dst)
-			if err == nil {
-				m.clipboard = fileClipboard{}
+		sel := m.activeSelectedPaths()
+		var items []clipItem
+		if len(sel) > 0 {
+			for _, e := range active {
+				if sel[e.Path] {
+					items = append(items, clipItem{path: e.Path, name: e.Name})
+				}
 			}
 		}
-		if err != nil {
-			m.statusMsg = fmt.Sprintf("error: %v", err)
+		if len(items) == 0 {
+			e := active[cursor]
+			items = []clipItem{{path: e.Path, name: e.Name}}
+		}
+		m.clipboard = fileClipboard{op: clipCopy, items: items}
+		if len(items) == 1 {
+			m.statusMsg = fmt.Sprintf("copied  %s", items[0].name)
 		} else {
-			m.statusMsg = fmt.Sprintf("pasted  %s", filepath.Base(dst))
+			m.statusMsg = fmt.Sprintf("copied  %d items", len(items))
+		}
+
+	case menuCut:
+		sel := m.activeSelectedPaths()
+		var items []clipItem
+		if len(sel) > 0 {
+			for _, e := range active {
+				if sel[e.Path] {
+					items = append(items, clipItem{path: e.Path, name: e.Name})
+				}
+			}
+		}
+		if len(items) == 0 {
+			e := active[cursor]
+			items = []clipItem{{path: e.Path, name: e.Name}}
+		}
+		m.clipboard = fileClipboard{op: clipCut, items: items}
+		if len(items) == 1 {
+			m.statusMsg = fmt.Sprintf("cut  %s", items[0].name)
+		} else {
+			m.statusMsg = fmt.Sprintf("cut  %d items", len(items))
+		}
+
+	case menuPaste:
+		if m.clipboard.op != clipNone && len(m.clipboard.items) > 0 {
+			var lastErr error
+			pasteCount := len(m.clipboard.items)
+			var lastName string
+			for _, item := range m.clipboard.items {
+				dst := filepath.Join(m.activeCwd(), item.name)
+				var err error
+				if m.clipboard.op == clipCopy {
+					err = appfs.CopyEntry(item.path, dst)
+				} else {
+					err = appfs.MoveEntry(item.path, dst)
+				}
+				if err != nil {
+					lastErr = err
+				} else {
+					lastName = item.name
+				}
+			}
+			if m.clipboard.op == clipCut {
+				m.clipboard = fileClipboard{}
+			}
+			if lastErr != nil {
+				m.statusMsg = fmt.Sprintf("error: %v", lastErr)
+			} else if pasteCount == 1 {
+				m.statusMsg = fmt.Sprintf("pasted  %s", lastName)
+			} else {
+				m.statusMsg = fmt.Sprintf("pasted  %d items", pasteCount)
+			}
 			if m.focus == focusSplit {
 				m.entries2, _ = m.loadEntries2()
 			} else {
@@ -1134,30 +1298,111 @@ func (m Model) updateSidebar(msg tea.KeyMsg) Model {
 func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 	switch msg.String() {
 	case "y", "Y":
-		target := m.deleteConfirm.target
-		m.deleteConfirm = deleteModal{}
-		if err := appfs.DeleteEntry(target.Path); err != nil {
-			m.statusMsg = fmt.Sprintf("delete error: %v", err)
-		} else {
-			m.statusMsg = fmt.Sprintf("deleted  %s", target.Name)
-			m.entries, _ = m.loadEntries()
-			if m.cursor >= len(m.entries) && m.cursor > 0 {
-				m.cursor = len(m.entries) - 1
-			}
-			if m.showSplit {
-				m.entries2, _ = m.loadEntries2()
-				if m.cursor2 >= len(m.entries2) && m.cursor2 > 0 {
-					m.cursor2 = len(m.entries2) - 1
-				}
-			}
-			m.previewPath = ""
-			m.previewEncoded = ""
+		targets := m.deleteConfirm.multiTargets
+		if len(targets) == 0 {
+			targets = []appfs.Entry{m.deleteConfirm.target}
 		}
+		m.deleteConfirm = deleteModal{}
+		var deleteErr error
+		deleted := 0
+		for _, target := range targets {
+			if err := appfs.DeleteEntry(target.Path); err != nil {
+				deleteErr = err
+			} else {
+				deleted++
+			}
+		}
+		// Clear selections that were just deleted.
+		m.selectedPaths = nil
+		m.selected2Paths = nil
+		m.lastSelectedPath = ""
+		m.lastSelected2Path = ""
+		if deleteErr != nil {
+			m.statusMsg = fmt.Sprintf("delete error: %v", deleteErr)
+		} else if deleted == 1 {
+			m.statusMsg = fmt.Sprintf("deleted  %s", targets[0].Name)
+		} else {
+			m.statusMsg = fmt.Sprintf("deleted  %d items", deleted)
+		}
+		m.entries, _ = m.loadEntries()
+		if m.cursor >= len(m.entries) && m.cursor > 0 {
+			m.cursor = len(m.entries) - 1
+		}
+		if m.showSplit {
+			m.entries2, _ = m.loadEntries2()
+			if m.cursor2 >= len(m.entries2) && m.cursor2 > 0 {
+				m.cursor2 = len(m.entries2) - 1
+			}
+		}
+		m.previewPath = ""
+		m.previewEncoded = ""
 	default:
 		// Any other key (n, esc, q, etc.) cancels.
 		m.deleteConfirm = deleteModal{}
 	}
 	return m
+}
+
+func (m Model) updateNewItemModal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		name := strings.TrimSpace(m.newItem.query)
+		kind := m.newItem.kind
+		m.newItem = newItemModal{}
+		if name == "" {
+			break
+		}
+		target := filepath.Join(m.activeCwd(), name)
+		var err error
+		if kind == newItemDir {
+			err = appfs.MkdirEntry(target)
+		} else {
+			err = appfs.CreateFileEntry(target)
+		}
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("error: %v", err)
+		} else {
+			if m.focus == focusSplit {
+				m.entries2, _ = m.loadEntries2()
+			} else {
+				m.entries, m.err = m.loadEntries()
+			}
+			// Move cursor to the newly created entry.
+			active := m.activeVisible()
+			for i, e := range active {
+				if e.Name == name {
+					if m.focus == focusSplit {
+						m.cursor2 = i
+					} else {
+						m.cursor = i
+					}
+					break
+				}
+			}
+			if kind == newItemDir {
+				m.statusMsg = fmt.Sprintf("created  %s/", name)
+			} else {
+				m.statusMsg = fmt.Sprintf("created  %s", name)
+			}
+		}
+		return m, m.maybeLoadPreview()
+
+	case tea.KeyEsc:
+		m.newItem = newItemModal{}
+
+	case tea.KeyBackspace:
+		runes := []rune(m.newItem.query)
+		if len(runes) > 0 {
+			m.newItem.query = string(runes[:len(runes)-1])
+		}
+
+	case tea.KeyRunes:
+		m.newItem.query += string(msg.Runes)
+
+	case tea.KeySpace:
+		m.newItem.query += " "
+	}
+	return m, nil
 }
 
 func (m Model) updateGoToModal(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -1426,6 +1671,47 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 				}
 			}
 		}
+
+	case key.Matches(msg, keyMap.MarkSelect):
+		if len(visible) > 0 {
+			e := visible[m.cursor]
+			if m.selectedPaths == nil {
+				m.selectedPaths = make(map[string]bool)
+			}
+			if m.selectedPaths[e.Path] {
+				delete(m.selectedPaths, e.Path)
+			} else {
+				m.selectedPaths[e.Path] = true
+				m.lastSelectedPath = e.Path
+			}
+		}
+
+	case key.Matches(msg, keyMap.MarkSelectRange):
+		if len(visible) > 0 {
+			if m.selectedPaths == nil {
+				m.selectedPaths = make(map[string]bool)
+			}
+			cur := visible[m.cursor]
+			lastIdx := -1
+			for i, e := range visible {
+				if e.Path == m.lastSelectedPath {
+					lastIdx = i
+					break
+				}
+			}
+			if lastIdx == -1 {
+				m.selectedPaths[cur.Path] = true
+				m.lastSelectedPath = cur.Path
+			} else {
+				start, end := lastIdx, m.cursor
+				if start > end {
+					start, end = end, start
+				}
+				for i := start; i <= end; i++ {
+					m.selectedPaths[visible[i].Path] = true
+				}
+			}
+		}
 	}
 	return m, nil
 }
@@ -1529,6 +1815,47 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 				}
 			}
 		}
+
+	case key.Matches(msg, keyMap.MarkSelect):
+		if len(m.entries2) > 0 {
+			e := m.entries2[m.cursor2]
+			if m.selected2Paths == nil {
+				m.selected2Paths = make(map[string]bool)
+			}
+			if m.selected2Paths[e.Path] {
+				delete(m.selected2Paths, e.Path)
+			} else {
+				m.selected2Paths[e.Path] = true
+				m.lastSelected2Path = e.Path
+			}
+		}
+
+	case key.Matches(msg, keyMap.MarkSelectRange):
+		if len(m.entries2) > 0 {
+			if m.selected2Paths == nil {
+				m.selected2Paths = make(map[string]bool)
+			}
+			cur := m.entries2[m.cursor2]
+			lastIdx := -1
+			for i, e := range m.entries2 {
+				if e.Path == m.lastSelected2Path {
+					lastIdx = i
+					break
+				}
+			}
+			if lastIdx == -1 {
+				m.selected2Paths[cur.Path] = true
+				m.lastSelected2Path = cur.Path
+			} else {
+				start, end := lastIdx, m.cursor2
+				if start > end {
+					start, end = end, start
+				}
+				for i := start; i <= end; i++ {
+					m.selected2Paths[m.entries2[i].Path] = true
+				}
+			}
+		}
 	}
 	return m, nil
 }
@@ -1561,6 +1888,10 @@ func (m Model) View() string {
 
 	if m.goTo.open {
 		return m.renderGoToModal()
+	}
+
+	if m.newItem.open {
+		return m.renderNewItemModal()
 	}
 
 	if m.imageModal.open {
@@ -1651,7 +1982,7 @@ func (m Model) renderNormal() string {
 
 	cols := []string{m.renderSidebar(listH), m.renderFileList(listH, listW)}
 	if m.showSplit {
-		cols = append(cols, m.renderFilePaneAt(listH, listW, m.entries2, m.cursor2, m.offset2, m.focus == focusSplit))
+		cols = append(cols, m.renderFilePaneAt(listH, listW, m.entries2, m.cursor2, m.offset2, m.focus == focusSplit, m.selected2Paths))
 	}
 	if m.showDetails {
 		cols = append(cols, m.renderDetails(listH))
@@ -1672,25 +2003,49 @@ func (m Model) renderDeleteModal() string {
 		clear = kitty.ClearAll()
 	}
 	target := m.deleteConfirm.target
-	kind := "file"
-	if target.IsDir {
-		kind = "directory"
-	}
-
+	multi := m.deleteConfirm.multiTargets
 	const modalW = 46
-	nameStyle := StyleSelected.Bold(true)
-	name := nameStyle.Render(target.Name)
-	if target.IsDir {
-		name = StyleDir.Bold(true).Render(target.Name + "/")
+	var warning, nameLine string
+	if len(multi) > 1 {
+		warning = StyleDim.Render(fmt.Sprintf("Delete %d items permanently?", len(multi)))
+		nameLine = StyleSelected.Bold(true).Render(fmt.Sprintf("%d selected items", len(multi)))
+	} else {
+		kind := "file"
+		if target.IsDir {
+			kind = "directory"
+		}
+		warning = StyleDim.Render(fmt.Sprintf("Delete this %s permanently?", kind))
+		nameStyle := StyleSelected.Bold(true)
+		nameLine = nameStyle.Render(target.Name)
+		if target.IsDir {
+			nameLine = StyleDir.Bold(true).Render(target.Name + "/")
+		}
 	}
-
-	warning := StyleDim.Render(fmt.Sprintf("Delete this %s permanently?", kind))
-	nameLine := name
 	confirm := StyleNormal.Render("  ") + StyleCursor.Render(" y ") +
 		StyleNormal.Render(" confirm   ") +
 		StyleDim.Render("any other key") + StyleNormal.Render(" cancel")
 
 	content := strings.Join([]string{"", warning, nameLine, "", confirm, ""}, "\n")
+	box := StylePaneActive.Width(modalW).Render(content)
+	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m Model) renderNewItemModal() string {
+	clear := ""
+	if kitty.IsSupported() {
+		clear = kitty.ClearAll()
+	}
+
+	const modalW = 50
+	var label string
+	if m.newItem.kind == newItemDir {
+		label = StyleDim.Render("New folder name:")
+	} else {
+		label = StyleDim.Render("New file name:")
+	}
+	input := StyleNormal.Render(m.newItem.query) + StyleCursor.Render(" ")
+	hint := StyleDim.Render("enter  confirm   esc  cancel")
+	content := strings.Join([]string{"", label, input, "", hint, ""}, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
 	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
@@ -1797,7 +2152,7 @@ func (m Model) renderSidebar(height int) string {
 	return paneStyle.Width(sidebarWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
 }
 
-func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor, offset int, isActive bool) string {
+func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor, offset int, isActive bool, selectedPaths map[string]bool) string {
 	innerW := width - 4
 
 	var rows []string
@@ -1812,6 +2167,8 @@ func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor
 		switch {
 		case i == cursor:
 			style = StyleCursor
+		case selectedPaths[e.Path]:
+			style = StyleSelected
 		case e.IsDir:
 			style = StyleDir
 		case appfs.IsHidden(e.Name):
@@ -1841,7 +2198,7 @@ func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor
 }
 
 func (m Model) renderFileList(height, width int) string {
-	return m.renderFilePaneAt(height, width, m.visibleEntries(), m.cursor, m.offset, m.focus == focusList)
+	return m.renderFilePaneAt(height, width, m.visibleEntries(), m.cursor, m.offset, m.focus == focusList, m.selectedPaths)
 }
 
 // calcPreviewSize returns the cell (cols, rows) that preserve the image's
@@ -2010,10 +2367,30 @@ func (m Model) buildStatus() string {
 	}
 
 	clip := ""
-	if m.clipboard.op == clipCopy {
-		clip = fmt.Sprintf("  [copy: %s]", m.clipboard.name)
-	} else if m.clipboard.op == clipCut {
-		clip = fmt.Sprintf("  [cut: %s]", m.clipboard.name)
+	if len(m.clipboard.items) > 0 {
+		switch m.clipboard.op {
+		case clipCopy:
+			if len(m.clipboard.items) == 1 {
+				clip = fmt.Sprintf("  [copy: %s]", m.clipboard.items[0].name)
+			} else {
+				clip = fmt.Sprintf("  [copy: %d items]", len(m.clipboard.items))
+			}
+		case clipCut:
+			if len(m.clipboard.items) == 1 {
+				clip = fmt.Sprintf("  [cut: %s]", m.clipboard.items[0].name)
+			} else {
+				clip = fmt.Sprintf("  [cut: %d items]", len(m.clipboard.items))
+			}
+		}
+	}
+
+	selCount := len(m.selectedPaths)
+	if m.focus == focusSplit {
+		selCount = len(m.selected2Paths)
+	}
+	sel := ""
+	if selCount > 0 {
+		sel = fmt.Sprintf("  [%d selected]", selCount)
 	}
 
 	parts := []string{
@@ -2027,5 +2404,5 @@ func (m Model) buildStatus() string {
 		"[q] Quit",
 	}
 
-	return " " + strings.Join(parts, " | ") + clip
+	return " " + strings.Join(parts, " | ") + clip + sel
 }

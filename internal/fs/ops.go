@@ -68,6 +68,20 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
+// MkdirEntry creates a new directory at path.
+func MkdirEntry(path string) error {
+	return os.MkdirAll(path, 0755)
+}
+
+// CreateFileEntry creates a new empty file at path.
+func CreateFileEntry(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
 // DeleteEntry removes a file or directory (recursively).
 func DeleteEntry(path string) error {
 	return os.RemoveAll(path)
