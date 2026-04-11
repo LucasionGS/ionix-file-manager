@@ -87,6 +87,7 @@ const (
 	menuCopyPath
 	menuCopyImage
 	menuFavoriteToggle
+	menuExtract
 	menuCancel
 )
 
@@ -98,6 +99,72 @@ type menuEntry struct {
 
 // menuEntries defines the context menu. Add new items here to extend it.
 // buildMenu returns only the context menu entries that apply to the current selection.
+
+// archiveExtractCmd returns a ready-to-run *exec.Cmd that extracts path into
+// its parent directory, or (nil, false) when the file is not a recognised
+// archive or the required tool is not installed.
+func archiveExtractCmd(path string) (*exec.Cmd, bool) {
+	name := strings.ToLower(filepath.Base(path))
+	dir := filepath.Dir(path)
+
+	buildTar := func() (*exec.Cmd, bool) {
+		t, err := exec.LookPath("tar")
+		if err != nil {
+			return nil, false
+		}
+		cmd := exec.Command(t, "xf", path)
+		cmd.Dir = dir
+		return cmd, true
+	}
+
+	switch {
+	case strings.HasSuffix(name, ".tar"),
+		strings.HasSuffix(name, ".tar.gz"),
+		strings.HasSuffix(name, ".tgz"),
+		strings.HasSuffix(name, ".tar.bz2"),
+		strings.HasSuffix(name, ".tbz2"),
+		strings.HasSuffix(name, ".tar.xz"),
+		strings.HasSuffix(name, ".txz"):
+		return buildTar()
+
+	case strings.HasSuffix(name, ".zip"):
+		t, err := exec.LookPath("unzip")
+		if err != nil {
+			return nil, false
+		}
+		cmd := exec.Command(t, path, "-d", dir)
+		cmd.Dir = dir
+		return cmd, true
+
+	case strings.HasSuffix(name, ".gz"):
+		t, err := exec.LookPath("gzip")
+		if err != nil {
+			return nil, false
+		}
+		cmd := exec.Command(t, "-dk", path)
+		cmd.Dir = dir
+		return cmd, true
+
+	case strings.HasSuffix(name, ".bz2"):
+		t, err := exec.LookPath("bzip2")
+		if err != nil {
+			return nil, false
+		}
+		cmd := exec.Command(t, "-dk", path)
+		cmd.Dir = dir
+		return cmd, true
+
+	case strings.HasSuffix(name, ".xz"):
+		t, err := exec.LookPath("xz")
+		if err != nil {
+			return nil, false
+		}
+		cmd := exec.Command(t, "-dk", path)
+		cmd.Dir = dir
+		return cmd, true
+	}
+	return nil, false
+}
 // Add new items here; the disabled-item pattern is replaced by simply omitting entries.
 func (m *Model) buildMenu() []menuEntry {
 	active := m.activeVisible()
@@ -129,6 +196,12 @@ func (m *Model) buildMenu() []menuEntry {
 
 	if e := selected(); hasSelection && !e.IsDir && appfs.IsImage(e.Name) {
 		items = append(items, menuEntry{icon: "󰋩", label: "Copy image", action: menuCopyImage})
+	}
+
+	if e := selected(); hasSelection && !e.IsDir {
+		if _, ok := archiveExtractCmd(e.Path); ok {
+			items = append(items, menuEntry{icon: "󰛫", label: "Extract", action: menuExtract})
+		}
 	}
 
 	if e := selected(); hasSelection && e.IsDir {
@@ -1655,6 +1728,21 @@ func (m Model) execMenuAction(item menuEntry) Model {
 				m.statusMsg = fmt.Sprintf("removed from favorites  %s", e.Name)
 			} else {
 				m.statusMsg = fmt.Sprintf("added to favorites  %s", e.Name)
+			}
+		}
+
+	case menuExtract:
+		e := active[cursor]
+		if cmd, ok := archiveExtractCmd(e.Path); ok {
+			if out, err := cmd.CombinedOutput(); err != nil {
+				m.statusMsg = fmt.Sprintf("extract error: %s", strings.TrimSpace(string(out)))
+			} else {
+				m.statusMsg = fmt.Sprintf("extracted  %s", e.Name)
+				if m.focus == focusSplit {
+					m.entries2, _ = m.loadEntries2()
+				} else {
+					m.entries, _ = m.loadEntries()
+				}
 			}
 		}
 
