@@ -259,6 +259,75 @@ type goToModal struct {
 }
 
 // ---------------------------------------------------------------------------
+// Macro modal
+// ---------------------------------------------------------------------------
+
+type macroModal struct {
+	open   bool
+	cursor int
+	macros []appconfig.Macro
+
+	// input phase: shown when the selected macro's Command contains $INPUT
+	inputMode  bool
+	inputQuery string
+	inputMacro appconfig.Macro
+}
+
+// ---------------------------------------------------------------------------
+// Macro manager modal
+// ---------------------------------------------------------------------------
+
+// macroManagerModal drives the full CRUD UI for macros.
+// editing=false → list view; editing=true → edit/create form.
+type macroManagerModal struct {
+	open   bool
+	cursor int
+	macros []appconfig.Macro
+
+	// form state
+	editing        bool
+	isNew          bool
+	editIdx        int
+	fieldCursor    int // 0=Name 1=Command 2=Filter 3=Background
+	editName       string
+	editCommand    string
+	editFilter     string // comma-separated extensions, e.g. ".png, .jpg"
+	editBackground bool
+	err            string
+}
+
+// editField appends s to the currently focused text field.
+func (mm *macroManagerModal) editField(s string) {
+	switch mm.fieldCursor {
+	case 0:
+		mm.editName += s
+	case 1:
+		mm.editCommand += s
+	case 2:
+		mm.editFilter += s
+	}
+}
+
+// deleteFieldChar removes the last rune from the currently focused text field.
+func (mm *macroManagerModal) deleteFieldChar() {
+	var target *string
+	switch mm.fieldCursor {
+	case 0:
+		target = &mm.editName
+	case 1:
+		target = &mm.editCommand
+	case 2:
+		target = &mm.editFilter
+	default:
+		return
+	}
+	runes := []rune(*target)
+	if len(runes) > 0 {
+		*target = string(runes[:len(runes)-1])
+	}
+}
+
+// ---------------------------------------------------------------------------
 // New item modal
 // ---------------------------------------------------------------------------
 
@@ -465,7 +534,7 @@ var allPaletteCommands = []paletteCmd{
 			m.previewPath = ""
 			m.previewEncoded = ""
 		}
-		_ = appconfig.Save(appconfig.Config{ShowDetails: m.showDetails, ShowHidden: m.showHidden})
+		saveUIPrefs(m.showDetails, m.showHidden)
 		return m, m.maybeLoadPreview()
 	}},
 	{"󰈉", "Toggle hidden files", func(m Model) (Model, tea.Cmd) {
@@ -478,7 +547,7 @@ var allPaletteCommands = []paletteCmd{
 			m.offset2 = 0
 			m.entries2, _ = m.loadEntries2()
 		}
-		_ = appconfig.Save(appconfig.Config{ShowDetails: m.showDetails, ShowHidden: m.showHidden})
+		saveUIPrefs(m.showDetails, m.showHidden)
 		return m, m.maybeLoadPreview()
 	}},
 	{"󰀼", "Toggle favorite", func(m Model) (Model, tea.Cmd) {
@@ -497,7 +566,11 @@ var allPaletteCommands = []paletteCmd{
 		}
 		return m, nil
 	}},
-	{"󰗼", "Quit", func(m Model) (Model, tea.Cmd) {
+	{"�", "Manage macros", func(m Model) (Model, tea.Cmd) {
+		m.openMacroManagerModal()
+		return m, nil
+	}},
+	{"�󰗼", "Quit", func(m Model) (Model, tea.Cmd) {
 		stopAudio(&m.audioPlayer)
 		return m, tea.Quit
 	}},
@@ -572,6 +645,9 @@ func filterAndSort(entries []appfs.Entry, query string) []appfs.Entry {
 // ---------------------------------------------------------------------------
 
 type editorClosedMsg struct{ err error }
+
+// macroClosedMsg is sent when a foreground macro process exits.
+type macroClosedMsg struct{ err error }
 
 // defaultEditor returns the user's preferred editor by checking $VISUAL,
 // $EDITOR, then falling back to common editors found in PATH.
@@ -1193,6 +1269,7 @@ var keyMap = struct {
 	NewFile               key.Binding
 	Rename                key.Binding
 	Palette               key.Binding
+	RunMacro              key.Binding
 }{
 	Up:              key.NewBinding(key.WithKeys("up", "k")),
 	Down:            key.NewBinding(key.WithKeys("down", "j")),
@@ -1218,6 +1295,7 @@ var keyMap = struct {
 	NewFile:         key.NewBinding(key.WithKeys("N")),
 	Rename:          key.NewBinding(key.WithKeys("f2")),
 	Palette:         key.NewBinding(key.WithKeys("f1")),
+	RunMacro:        key.NewBinding(key.WithKeys(",")),
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1329,8 @@ type Model struct {
 	audioPlayer      audioModal
 	renameModal      renameModal
 	search           searchModel
+	macroRunner      macroModal
+	macroManager     macroManagerModal
 	showDetails      bool
 	previewPath      string
 	previewEncoded   string // base64-encoded, ready for kitty.Place
@@ -1324,6 +1404,15 @@ func (m *Model) toggleFavorite(path string) {
 	}
 	cfg, _ := appconfig.Load()
 	cfg.Favorites = m.favorites
+	_ = appconfig.Save(cfg)
+}
+
+// saveUIPrefs patches ShowDetails and ShowHidden into the existing config and saves,
+// preserving Colors, Favorites, and any other fields.
+func saveUIPrefs(showDetails, showHidden bool) {
+	cfg, _ := appconfig.Load()
+	cfg.ShowDetails = showDetails
+	cfg.ShowHidden = showHidden
 	_ = appconfig.Save(cfg)
 }
 
@@ -1585,6 +1674,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.entries, _ = m.loadEntries()
 		return m, m.maybeLoadPreview()
 
+	case macroClosedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("macro error: %v", msg.err)
+		}
+		m.entries, _ = m.loadEntries()
+		return m, m.maybeLoadPreview()
+
 	case tea.KeyMsg:
 		// Image modal captures all input while open.
 		if m.imageModal.open {
@@ -1666,6 +1762,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.palette.open {
 			var cmd tea.Cmd
 			m, cmd = m.updatePalette(msg)
+			return m, cmd
+		}
+
+		// Macro manager captures all input while open.
+		if m.macroManager.open {
+			var cmd tea.Cmd
+			m, cmd = m.updateMacroManager(msg)
+			return m, cmd
+		}
+
+		// Macro modal captures all input while open.
+		if m.macroRunner.open {
+			var cmd tea.Cmd
+			m, cmd = m.updateMacroModal(msg)
 			return m, cmd
 		}
 
@@ -1757,10 +1867,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.previewPath = ""
 				m.previewEncoded = ""
 			}
-			_ = appconfig.Save(appconfig.Config{
-				ShowDetails: m.showDetails,
-				ShowHidden:  m.showHidden,
-			})
+			saveUIPrefs(m.showDetails, m.showHidden)
 
 		case key.Matches(msg, keyMap.Search):
 			if m.focus != focusSplit {
@@ -1845,6 +1952,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keyMap.Palette):
 			m.palette = paletteModel{open: true}
 			m.statusMsg = ""
+
+		case key.Matches(msg, keyMap.RunMacro):
+			if m.focus != focusSidebar {
+				m.openMacroModal()
+			}
 
 		case key.Matches(msg, keyMap.ToggleSplit):
 			if m.showSplit {
@@ -2780,10 +2892,7 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.offset2 = 0
 			m.entries2, _ = m.loadEntries2()
 		}
-		_ = appconfig.Save(appconfig.Config{
-			ShowDetails: m.showDetails,
-			ShowHidden:  m.showHidden,
-		})
+		saveUIPrefs(m.showDetails, m.showHidden)
 
 	case key.Matches(msg, keyMap.ToggleFavorite):
 		if len(visible) > 0 {
@@ -2926,10 +3035,7 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.offset2 = 0
 		m.entries, _ = m.loadEntries()
 		m.entries2, _ = m.loadEntries2()
-		_ = appconfig.Save(appconfig.Config{
-			ShowDetails: m.showDetails,
-			ShowHidden:  m.showHidden,
-		})
+		saveUIPrefs(m.showDetails, m.showHidden)
 
 	case key.Matches(msg, keyMap.ToggleFavorite):
 		if len(m.entries2) > 0 {
@@ -3029,6 +3135,14 @@ func (m Model) View() string {
 
 	if m.palette.open {
 		return m.renderPalette()
+	}
+
+	if m.macroManager.open {
+		return m.renderMacroManager()
+	}
+
+	if m.macroRunner.open {
+		return m.renderMacroModal()
 	}
 
 	if m.imageModal.open {
@@ -3612,4 +3726,601 @@ func (m Model) buildStatus() string {
 	}
 
 	return " " + strings.Join(parts, " | ") + clip + sel
+}
+
+// ---------------------------------------------------------------------------
+// Macro runner
+// ---------------------------------------------------------------------------
+
+// shellQuote wraps s in single quotes, escaping any single quotes within.
+// This makes the value safe to embed in a sh -c command string.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// openMacroModal builds the list of applicable macros and opens the modal.
+// If no macros apply it sets a status message instead.
+func (m *Model) openMacroModal() {
+	allMacros, _ := appconfig.LoadMacros()
+	if len(allMacros) == 0 {
+		m.statusMsg = "no macros configured — open 'Manage macros' from the palette"
+		return
+	}
+
+	visible := m.activeVisible()
+	cursor := m.activeCursor()
+
+	var currentExt string
+	var isDir bool
+	if len(visible) > 0 && cursor < len(visible) {
+		e := visible[cursor]
+		isDir = e.IsDir
+		if !e.IsDir {
+			currentExt = strings.ToLower(filepath.Ext(e.Name))
+		}
+	}
+
+	var applicable []appconfig.Macro
+	for _, macro := range allMacros {
+		if len(macro.Filter) == 0 {
+			applicable = append(applicable, macro)
+			continue
+		}
+		if isDir {
+			continue
+		}
+		for _, ext := range macro.Filter {
+			if strings.ToLower(ext) == currentExt {
+				applicable = append(applicable, macro)
+				break
+			}
+		}
+	}
+
+	if len(applicable) == 0 {
+		m.statusMsg = "no macros for this file type"
+		return
+	}
+
+	m.macroRunner = macroModal{open: true, macros: applicable}
+	m.statusMsg = ""
+}
+
+// updateMacroModal handles key events while the macro modal is open.
+func (m Model) updateMacroModal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if m.macroRunner.inputMode {
+		return m.updateMacroInput(msg)
+	}
+
+	switch msg.Type {
+	case tea.KeyEnter:
+		if len(m.macroRunner.macros) > 0 {
+			macro := m.macroRunner.macros[m.macroRunner.cursor]
+			if strings.Contains(macro.Command, "$INPUT") {
+				m.macroRunner.inputMode = true
+				m.macroRunner.inputQuery = ""
+				m.macroRunner.inputMacro = macro
+				return m, nil
+			}
+			m.macroRunner = macroModal{}
+			return m.runMacro(macro, "")
+		}
+		m.macroRunner = macroModal{}
+
+	case tea.KeyEsc:
+		m.macroRunner = macroModal{}
+
+	case tea.KeyUp:
+		if m.macroRunner.cursor > 0 {
+			m.macroRunner.cursor--
+		}
+
+	case tea.KeyDown:
+		if m.macroRunner.cursor < len(m.macroRunner.macros)-1 {
+			m.macroRunner.cursor++
+		}
+	}
+	return m, nil
+}
+
+// updateMacroInput handles key events in the $INPUT prompt phase.
+func (m Model) updateMacroInput(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		macro := m.macroRunner.inputMacro
+		input := m.macroRunner.inputQuery
+		m.macroRunner = macroModal{}
+		return m.runMacro(macro, input)
+
+	case tea.KeyEsc:
+		m.macroRunner = macroModal{}
+
+	case tea.KeyBackspace:
+		runes := []rune(m.macroRunner.inputQuery)
+		if len(runes) > 0 {
+			m.macroRunner.inputQuery = string(runes[:len(runes)-1])
+		}
+
+	case tea.KeyRunes:
+		m.macroRunner.inputQuery += string(msg.Runes)
+
+	case tea.KeySpace:
+		m.macroRunner.inputQuery += " "
+	}
+	return m, nil
+}
+
+// runMacro expands variables in macro.Command and executes it.
+// If macro.Background is true the command is started without suspending the TUI.
+func (m Model) runMacro(macro appconfig.Macro, input string) (Model, tea.Cmd) {
+	visible := m.activeVisible()
+	cursor := m.activeCursor()
+	sel := m.activeSelectedPaths()
+
+	// Collect target paths: all marked files, or just the cursor entry.
+	var files []string
+	for _, e := range visible {
+		if sel[e.Path] {
+			files = append(files, e.Path)
+		}
+	}
+	if len(files) == 0 && len(visible) > 0 && cursor < len(visible) {
+		files = []string{visible[cursor].Path}
+	}
+
+	var primaryFile, primaryName string
+	if len(files) > 0 {
+		primaryFile = files[0]
+		primaryName = filepath.Base(primaryFile)
+	}
+
+	// Build a space-separated, shell-quoted list of all target paths.
+	quotedFiles := make([]string, len(files))
+	for i, f := range files {
+		quotedFiles[i] = shellQuote(f)
+	}
+	filesStr := strings.Join(quotedFiles, " ")
+
+	// Substitute variables. $FILES before $FILE to avoid partial replacement.
+	command := macro.Command
+	command = strings.ReplaceAll(command, "$FILES", filesStr)
+	command = strings.ReplaceAll(command, "$FILE", shellQuote(primaryFile))
+	command = strings.ReplaceAll(command, "$NAME", shellQuote(primaryName))
+	command = strings.ReplaceAll(command, "$DIR", shellQuote(m.activeCwd()))
+	command = strings.ReplaceAll(command, "$INPUT", shellQuote(input))
+
+	c := exec.Command("sh", "-c", command)
+	c.Dir = m.activeCwd()
+
+	if macro.Background {
+		if err := c.Start(); err != nil {
+			m.statusMsg = fmt.Sprintf("macro error: %v", err)
+		} else {
+			m.statusMsg = fmt.Sprintf("running  %s", macro.Name)
+			// Reap the child to avoid zombies.
+			go func() { _ = c.Wait() }()
+		}
+		return m, nil
+	}
+
+	return m, tea.ExecProcess(c, func(err error) tea.Msg {
+		return macroClosedMsg{err: err}
+	})
+}
+
+// renderMacroModal renders the macro selection list or the $INPUT prompt.
+func (m Model) renderMacroModal() string {
+	if m.macroRunner.inputMode {
+		return m.renderMacroInputModal()
+	}
+
+	const modalW = 54
+	const maxVisible = 10
+
+	macros := m.macroRunner.macros
+	label := StyleDim.Render("Run macro  [,]")
+	hint := StyleDim.Render("↑/↓ navigate   enter  run   esc  close")
+
+	var rows []string
+	rows = append(rows, "", label, "")
+
+	if len(macros) == 0 {
+		rows = append(rows, StyleDim.Render("  no macros available"))
+	} else {
+		start := 0
+		if m.macroRunner.cursor >= maxVisible {
+			start = m.macroRunner.cursor - maxVisible + 1
+		}
+		end := start + maxVisible
+		if end > len(macros) {
+			end = len(macros)
+		}
+		innerW := modalW - 4
+		for i := start; i < end; i++ {
+			macro := macros[i]
+			var filterSuffix string
+			if len(macro.Filter) > 0 {
+				filterSuffix = "  " + StyleDim.Render(strings.Join(macro.Filter, " "))
+			}
+			name := fmt.Sprintf("  󰆍  %s", macro.Name)
+			if i == m.macroRunner.cursor {
+				rows = append(rows, StyleCursor.Width(innerW).Render(name)+filterSuffix)
+			} else {
+				rows = append(rows, StyleNormal.MaxWidth(innerW).Render(name+filterSuffix))
+			}
+		}
+	}
+
+	rows = append(rows, "", hint, "")
+	box := StylePaneActive.Width(modalW).Render(strings.Join(rows, "\n"))
+	bg := m.renderNormal()
+	out := overlayCenter(bg, box, m.width, m.height)
+	if kitty.IsSupported() {
+		out += kitty.ClearAll()
+	}
+	return out
+}
+
+// renderMacroInputModal renders the text-input prompt for $INPUT macros.
+func (m Model) renderMacroInputModal() string {
+	const modalW = 54
+	macro := m.macroRunner.inputMacro
+	label := StyleDim.Render("Input for: " + macro.Name)
+	input := StyleNormal.Render(m.macroRunner.inputQuery) + StyleCursor.Render(" ")
+	hint := StyleDim.Render("enter  run   esc  cancel")
+	content := strings.Join([]string{"", label, input, "", hint, ""}, "\n")
+	box := StylePaneActive.Width(modalW).Render(content)
+	return m.overlayModal(box)
+}
+
+// ---------------------------------------------------------------------------
+// Macro manager – open / save helpers
+// ---------------------------------------------------------------------------
+
+// openMacroManagerModal loads macros from macros.json and opens the CRUD manager.
+func (m *Model) openMacroManagerModal() {
+	loaded, _ := appconfig.LoadMacros()
+	macros := make([]appconfig.Macro, len(loaded))
+	copy(macros, loaded)
+	m.macroManager = macroManagerModal{
+		open:   true,
+		macros: macros,
+	}
+	m.statusMsg = ""
+}
+
+// saveMacrosFromManager persists the manager's macro list to macros.json.
+func (m *Model) saveMacrosFromManager() {
+	_ = appconfig.SaveMacros(m.macroManager.macros)
+}
+
+// startEditMacro switches the manager into edit mode for macros[idx].
+func (m *Model) startEditMacro(idx int) {
+	mac := m.macroManager.macros[idx]
+	m.macroManager.editing = true
+	m.macroManager.isNew = false
+	m.macroManager.editIdx = idx
+	m.macroManager.fieldCursor = 0
+	m.macroManager.editName = mac.Name
+	m.macroManager.editCommand = mac.Command
+	m.macroManager.editFilter = strings.Join(mac.Filter, ", ")
+	m.macroManager.editBackground = mac.Background
+	m.macroManager.err = ""
+}
+
+// startNewMacro switches the manager into create mode with blank fields.
+func (m *Model) startNewMacro() {
+	m.macroManager.editing = true
+	m.macroManager.isNew = true
+	m.macroManager.editIdx = -1
+	m.macroManager.fieldCursor = 0
+	m.macroManager.editName = ""
+	m.macroManager.editCommand = ""
+	m.macroManager.editFilter = ""
+	m.macroManager.editBackground = false
+	m.macroManager.err = ""
+}
+
+// ---------------------------------------------------------------------------
+// Macro manager – update
+// ---------------------------------------------------------------------------
+
+func (m Model) updateMacroManager(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if m.macroManager.editing {
+		return m.updateMacroManagerForm(msg)
+	}
+	return m.updateMacroManagerList(msg)
+}
+
+func (m Model) updateMacroManagerList(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.macroManager.open = false
+
+	case tea.KeyUp:
+		if m.macroManager.cursor > 0 {
+			m.macroManager.cursor--
+		}
+
+	case tea.KeyDown:
+		if m.macroManager.cursor < len(m.macroManager.macros)-1 {
+			m.macroManager.cursor++
+		}
+
+	case tea.KeyEnter:
+		if len(m.macroManager.macros) > 0 && m.macroManager.cursor < len(m.macroManager.macros) {
+			m.startEditMacro(m.macroManager.cursor)
+		}
+
+	case tea.KeyDelete:
+		if len(m.macroManager.macros) > 0 && m.macroManager.cursor < len(m.macroManager.macros) {
+			idx := m.macroManager.cursor
+			m.macroManager.macros = append(
+				append([]appconfig.Macro{}, m.macroManager.macros[:idx]...),
+				m.macroManager.macros[idx+1:]...,
+			)
+			if m.macroManager.cursor >= len(m.macroManager.macros) && m.macroManager.cursor > 0 {
+				m.macroManager.cursor--
+			}
+			m.saveMacrosFromManager()
+		}
+
+	case tea.KeyRunes:
+		switch string(msg.Runes) {
+		case "e":
+			if len(m.macroManager.macros) > 0 && m.macroManager.cursor < len(m.macroManager.macros) {
+				m.startEditMacro(m.macroManager.cursor)
+			}
+		case "n":
+			m.startNewMacro()
+		case "d":
+			if len(m.macroManager.macros) > 0 && m.macroManager.cursor < len(m.macroManager.macros) {
+				idx := m.macroManager.cursor
+				m.macroManager.macros = append(
+					append([]appconfig.Macro{}, m.macroManager.macros[:idx]...),
+					m.macroManager.macros[idx+1:]...,
+				)
+				if m.macroManager.cursor >= len(m.macroManager.macros) && m.macroManager.cursor > 0 {
+					m.macroManager.cursor--
+				}
+				m.saveMacrosFromManager()
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m Model) updateMacroManagerForm(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.macroManager.editing = false
+		m.macroManager.err = ""
+
+	case tea.KeyUp:
+		if m.macroManager.fieldCursor > 0 {
+			m.macroManager.fieldCursor--
+		}
+
+	case tea.KeyDown, tea.KeyTab:
+		if m.macroManager.fieldCursor < 3 {
+			m.macroManager.fieldCursor++
+		}
+
+	case tea.KeyShiftTab:
+		if m.macroManager.fieldCursor > 0 {
+			m.macroManager.fieldCursor--
+		}
+
+	case tea.KeyEnter:
+		return m.saveMacroFromForm()
+
+	case tea.KeyBackspace:
+		m.macroManager.deleteFieldChar()
+
+	case tea.KeySpace:
+		if m.macroManager.fieldCursor == 3 {
+			m.macroManager.editBackground = !m.macroManager.editBackground
+		} else {
+			m.macroManager.editField(" ")
+		}
+
+	case tea.KeyRunes:
+		m.macroManager.editField(string(msg.Runes))
+	}
+	return m, nil
+}
+
+// saveMacroFromForm validates form fields and saves the macro.
+func (m Model) saveMacroFromForm() (Model, tea.Cmd) {
+	name := strings.TrimSpace(m.macroManager.editName)
+	command := strings.TrimSpace(m.macroManager.editCommand)
+
+	if name == "" {
+		m.macroManager.err = "name is required"
+		m.macroManager.fieldCursor = 0
+		return m, nil
+	}
+	if command == "" {
+		m.macroManager.err = "command is required"
+		m.macroManager.fieldCursor = 1
+		return m, nil
+	}
+
+	// Parse and normalise filter extensions.
+	var filter []string
+	for _, raw := range strings.Split(m.macroManager.editFilter, ",") {
+		ext := strings.TrimSpace(raw)
+		if ext == "" {
+			continue
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		filter = append(filter, strings.ToLower(ext))
+	}
+
+	macro := appconfig.Macro{
+		Name:       name,
+		Command:    command,
+		Filter:     filter,
+		Background: m.macroManager.editBackground,
+	}
+	if m.macroManager.isNew {
+		m.macroManager.macros = append(m.macroManager.macros, macro)
+		m.macroManager.cursor = len(m.macroManager.macros) - 1
+	} else {
+		m.macroManager.macros[m.macroManager.editIdx] = macro
+		m.macroManager.cursor = m.macroManager.editIdx
+	}
+	m.macroManager.editing = false
+	m.macroManager.err = ""
+	m.saveMacrosFromManager()
+	return m, nil
+}
+
+// ---------------------------------------------------------------------------
+// Macro manager – render
+// ---------------------------------------------------------------------------
+
+func (m Model) renderMacroManager() string {
+	if m.macroManager.editing {
+		return m.renderMacroManagerForm()
+	}
+	return m.renderMacroManagerList()
+}
+
+func (m Model) renderMacroManagerList() string {
+	const modalW = 64
+	const maxVisible = 10
+
+	macros := m.macroManager.macros
+	count := fmt.Sprintf("(%d)", len(macros))
+	header := StyleTitle.Render("Macros") + "  " + StyleDim.Render(count)
+	hint := StyleDim.Render("[n] New  [e/↵] Edit  [d/del] Delete  [esc] Close")
+
+	var rows []string
+	rows = append(rows, "", header, "")
+
+	if len(macros) == 0 {
+		rows = append(rows, StyleDim.Render("  No macros yet — press [n] to create one."), "")
+	} else {
+		start := 0
+		if m.macroManager.cursor >= maxVisible {
+			start = m.macroManager.cursor - maxVisible + 1
+		}
+		end := start + maxVisible
+		if end > len(macros) {
+			end = len(macros)
+		}
+		innerW := modalW - 4
+		for i := start; i < end; i++ {
+			mac := macros[i]
+			filterStr := strings.Join(mac.Filter, " ")
+			name := "  󰆍  " + mac.Name
+			if filterStr != "" {
+				name += "  " + filterStr
+			}
+			if mac.Background {
+				name += "  bg"
+			}
+			if i == m.macroManager.cursor {
+				rows = append(rows, StyleCursor.Width(innerW).Render(name))
+			} else {
+				rows = append(rows, StyleNormal.MaxWidth(innerW).Render(name))
+			}
+		}
+		rows = append(rows, "")
+	}
+
+	rows = append(rows, hint, "")
+	box := StylePaneActive.Width(modalW).Render(strings.Join(rows, "\n"))
+	bg := m.renderNormal()
+	out := overlayCenter(bg, box, m.width, m.height)
+	if kitty.IsSupported() {
+		out += kitty.ClearAll()
+	}
+	return out
+}
+
+func (m Model) renderMacroManagerForm() string {
+	const modalW = 64
+	mm := m.macroManager
+	innerW := modalW - 4
+
+	var titleStr string
+	if mm.isNew {
+		titleStr = "New Macro"
+	} else {
+		titleStr = "Edit Macro"
+	}
+	title := StyleTitle.Render(titleStr)
+
+	renderTextField := func(label, value string, fieldIdx int) string {
+		active := mm.fieldCursor == fieldIdx
+		var lbl string
+		if active {
+			lbl = StyleSelected.Render(label)
+		} else {
+			lbl = StyleDetailsLabel.Render(label)
+		}
+		var valRender string
+		if active {
+			valRender = StyleNormal.Render("  "+value) + StyleCursor.Render(" ")
+		} else {
+			disp := value
+			if disp == "" {
+				disp = "(empty)"
+			}
+			valRender = StyleDim.Render("  " + disp)
+		}
+		return lbl + "\n" + valRender
+	}
+
+	renderBoolField := func(label string, val bool, fieldIdx int) string {
+		active := mm.fieldCursor == fieldIdx
+		var lbl string
+		if active {
+			lbl = StyleSelected.Render(label)
+		} else {
+			lbl = StyleDetailsLabel.Render(label)
+		}
+		check := "[ ]"
+		if val {
+			check = "[x]"
+		}
+		text := "  " + check + " Run without suspending the TUI"
+		var valRender string
+		if active {
+			valRender = StyleCursor.Width(innerW).Render(text)
+		} else {
+			valRender = StyleNormal.Render(text)
+		}
+		return lbl + "\n" + valRender
+	}
+
+	vars := StyleDim.Render("  Variables: $FILE  $FILES  $NAME  $DIR  $INPUT")
+	hint := StyleDim.Render("↑/↓/tab  navigate   space  toggle bg   enter  save   esc  back")
+
+	var rows []string
+	rows = append(rows, "", title, "")
+	rows = append(rows, renderTextField("NAME", mm.editName, 0))
+	rows = append(rows, "")
+	rows = append(rows, renderTextField("COMMAND", mm.editCommand, 1))
+	rows = append(rows, "")
+	rows = append(rows, renderTextField("FILTER  (comma-separated, e.g. .png, .jpg)", mm.editFilter, 2))
+	rows = append(rows, "")
+	rows = append(rows, renderBoolField("BACKGROUND", mm.editBackground, 3))
+	rows = append(rows, "", vars, "")
+	if mm.err != "" {
+		rows = append(rows, StyleSelected.Render("  ⚠ "+mm.err), "")
+	}
+	rows = append(rows, hint, "")
+
+	box := StylePaneActive.Width(modalW).Render(strings.Join(rows, "\n"))
+	bg := m.renderNormal()
+	out := overlayCenter(bg, box, m.width, m.height)
+	if kitty.IsSupported() {
+		out += kitty.ClearAll()
+	}
+	return out
 }

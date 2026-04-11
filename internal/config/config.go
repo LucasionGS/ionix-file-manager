@@ -14,6 +14,24 @@ import (
 
 const appName = "ifm"
 
+// Macro defines a user-configured shell command to run on files.
+// In Command, the following variables are substituted before execution:
+//   - $FILE   – absolute path of the focused/selected file (shell-quoted)
+//   - $FILES  – space-separated shell-quoted list of all marked files (or $FILE if none marked)
+//   - $DIR    – current working directory (shell-quoted)
+//   - $NAME   – basename of the focused file (shell-quoted)
+//   - $INPUT  – text entered by the user in the prompt (shell-quoted); triggers an input prompt
+//
+// Filter lists file extensions (e.g. ".png", ".jpg") that this macro applies to.
+// An empty Filter means the macro is shown for all entries.
+// Background runs the command without suspending the TUI (fire-and-forget).
+type Macro struct {
+	Name       string   `json:"name"`
+	Command    string   `json:"command"`
+	Filter     []string `json:"filter,omitempty"`
+	Background bool     `json:"background,omitempty"`
+}
+
 // Config holds all persistent user preferences.
 type Config struct {
 	ShowDetails bool     `json:"show_details"`
@@ -39,8 +57,8 @@ type Colors struct {
 	CursorFg string `json:"cursor_fg,omitempty"` // text color on highlighted cursor rows
 }
 
-// configPath returns the path to the config file, creating the directory if needed.
-func configPath() (string, error) {
+// configDir returns the path to the ifm config directory, creating it if needed.
+func configDir() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -49,7 +67,59 @@ func configPath() (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
+	return dir, nil
+}
+
+// configPath returns the path to the config file.
+func configPath() (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
 	return filepath.Join(dir, "config.json"), nil
+}
+
+// macrosPath returns the path to the macros file.
+func macrosPath() (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "macros.json"), nil
+}
+
+// LoadMacros reads macros.json and returns the slice of Macro.
+// If the file does not exist an empty slice is returned without error.
+func LoadMacros() ([]Macro, error) {
+	path, err := macrosPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var macros []Macro
+	if err := json.Unmarshal(data, &macros); err != nil {
+		return nil, err
+	}
+	return macros, nil
+}
+
+// SaveMacros writes macros to macros.json.
+func SaveMacros(macros []Macro) error {
+	path, err := macrosPath()
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(macros, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 // Load reads the config file and returns the parsed Config.
