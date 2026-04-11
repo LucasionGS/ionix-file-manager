@@ -165,6 +165,7 @@ func archiveExtractCmd(path string) (*exec.Cmd, bool) {
 	}
 	return nil, false
 }
+
 // Add new items here; the disabled-item pattern is replaced by simply omitting entries.
 func (m *Model) buildMenu() []menuEntry {
 	active := m.activeVisible()
@@ -480,6 +481,7 @@ var allPaletteCommands = []paletteCmd{
 		return m, nil
 	}},
 	{"󰗼", "Quit", func(m Model) (Model, tea.Cmd) {
+		stopAudio(&m.audioPlayer)
 		return m, tea.Quit
 	}},
 }
@@ -662,6 +664,122 @@ type gifTickMsg struct{ path string }
 func gifTickCmd(path string, d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(_ time.Time) tea.Msg { return gifTickMsg{path: path} })
 }
+
+// ---------------------------------------------------------------------------
+// Audio modal
+// ---------------------------------------------------------------------------
+
+type audioModal struct {
+	open     bool
+	path     string
+	name     string  // display name
+	dur      float64 // total duration in seconds (0 = unknown)
+	elapsed  float64 // seconds played
+	paused   bool
+	proc     *exec.Cmd
+	playerOK bool // a suitable player was found
+}
+
+// audioTickMsg fires every second while audio is playing.
+type audioTickMsg struct{ path string }
+
+func audioTickCmd(path string) tea.Cmd {
+	return tea.Tick(time.Second, func(_ time.Time) tea.Msg { return audioTickMsg{path: path} })
+}
+
+// audioDurMsg carries the probed duration for a file.
+type audioDurMsg struct {
+	path string
+	dur  float64
+}
+
+// probeDurationCmd uses ffprobe to determine the duration of an audio file.
+func probeDurationCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		ffprobe, err := exec.LookPath("ffprobe")
+		if err != nil {
+			return audioDurMsg{path: path, dur: 0}
+		}
+		out, err := exec.Command(ffprobe,
+			"-v", "error",
+			"-show_entries", "format=duration",
+			"-of", "default=noprint_wrappers=1:nokey=1",
+			path,
+		).Output()
+		if err != nil {
+			return audioDurMsg{path: path, dur: 0}
+		}
+		var d float64
+		fmt.Sscanf(strings.TrimSpace(string(out)), "%f", &d)
+		return audioDurMsg{path: path, dur: d}
+	}
+}
+
+// audioPlayer returns a ready-to-start *exec.Cmd for the best available player,
+// or nil if none is found.  The process must be started with Start() (not Run()).
+func audioPlayer(path string) *exec.Cmd {
+	// Prefer mpv (headless), then ffplay (shows nothing without -nodisp).
+	if bin, err := exec.LookPath("mpv"); err == nil {
+		cmd := exec.Command(bin,
+			"--no-video",
+			"--quiet",
+			"--really-quiet",
+			path,
+		)
+		return cmd
+	}
+	if bin, err := exec.LookPath("ffplay"); err == nil {
+		cmd := exec.Command(bin,
+			"-nodisp",
+			"-autoexit",
+			"-loglevel", "quiet",
+			path,
+		)
+		return cmd
+	}
+	return nil
+}
+
+// stopAudio kills the player process if one is running.
+func stopAudio(a *audioModal) {
+	if a == nil || a.proc == nil || a.proc.Process == nil {
+		return
+	}
+	_ = a.proc.Process.Kill()
+	_ = a.proc.Wait()
+	a.proc = nil
+}
+
+// pauseAudio sends SIGSTOP to the player process.
+func pauseAudio(a *audioModal) {
+	if a == nil || a.proc == nil || a.proc.Process == nil {
+		return
+	}
+	_ = a.proc.Process.Signal(sigStop)
+}
+
+// resumeAudio sends SIGCONT to the player process.
+func resumeAudio(a *audioModal) {
+	if a == nil || a.proc == nil || a.proc.Process == nil {
+		return
+	}
+	_ = a.proc.Process.Signal(sigCont)
+}
+
+// audioPlayerFinishedCmd returns a command that waits for the player process
+// to finish, then sends an audioFinishedMsg.
+type audioFinishedMsg struct{ path string }
+
+func waitAudioCmd(path string, cmd *exec.Cmd) tea.Cmd {
+	return func() tea.Msg {
+		_ = cmd.Wait()
+		return audioFinishedMsg{path: path}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Image modal messages
+// ---------------------------------------------------------------------------
 
 type imageModalLoadedMsg struct {
 	path      string
@@ -900,6 +1018,35 @@ func (m *Model) preloadNeighbours(imgIndices []int, curIdx int, visible []appfs.
 	return tea.Batch(cmds...)
 }
 
+// openAudioModal starts playback of path and opens the audio modal.
+// If another track is already playing it is stopped first.
+func (m *Model) openAudioModal(path string) tea.Cmd {
+	// Stop any current playback.
+	stopAudio(&m.audioPlayer)
+
+	cmd := audioPlayer(path)
+	if cmd == nil {
+		m.statusMsg = "audio playback requires mpv or ffplay"
+		return nil
+	}
+	if err := cmd.Start(); err != nil {
+		m.statusMsg = fmt.Sprintf("audio error: %v", err)
+		return nil
+	}
+	m.audioPlayer = audioModal{
+		open:     true,
+		path:     path,
+		name:     filepath.Base(path),
+		proc:     cmd,
+		playerOK: true,
+	}
+	return tea.Batch(
+		audioTickCmd(path),
+		probeDurationCmd(path),
+		waitAudioCmd(path, cmd),
+	)
+}
+
 // scaleDown resizes src so neither dimension exceeds maxW×maxH, preserving
 // aspect ratio. Returns src unchanged if it already fits.
 func scaleDown(src image.Image, maxW, maxH int) image.Image {
@@ -1010,6 +1157,7 @@ type Model struct {
 	newItem          newItemModal
 	palette          paletteModel
 	imageModal       imageModalState
+	audioPlayer      audioModal
 	search           searchModel
 	showDetails      bool
 	previewPath      string
@@ -1317,6 +1465,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case audioDurMsg:
+		if m.audioPlayer.open && m.audioPlayer.path == msg.path {
+			m.audioPlayer.dur = msg.dur
+		}
+		return m, nil
+
+	case audioTickMsg:
+		if m.audioPlayer.open && m.audioPlayer.path == msg.path && !m.audioPlayer.paused {
+			m.audioPlayer.elapsed++
+			return m, audioTickCmd(msg.path)
+		}
+		return m, nil
+
+	case audioFinishedMsg:
+		if m.audioPlayer.open && m.audioPlayer.path == msg.path {
+			m.audioPlayer.proc = nil
+			// Leave modal open so user can see it finished; elapsed stays.
+			m.audioPlayer.paused = true
+		}
+		return m, nil
+
 	case editorClosedMsg:
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("editor error: %v", msg.err)
@@ -1341,6 +1510,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, cmd
 				}
 				return m, nil
+			}
+			return m, nil
+		}
+
+		// Audio modal captures all input while open.
+		if m.audioPlayer.open {
+			switch {
+			case msg.String() == "q" || msg.String() == "Q" || msg.Type == tea.KeyEsc:
+				stopAudio(&m.audioPlayer)
+				m.audioPlayer = audioModal{}
+			case msg.String() == " " || msg.String() == "p":
+				if m.audioPlayer.paused {
+					resumeAudio(&m.audioPlayer)
+					m.audioPlayer.paused = false
+					return m, audioTickCmd(m.audioPlayer.path)
+				} else {
+					pauseAudio(&m.audioPlayer)
+					m.audioPlayer.paused = true
+				}
 			}
 			return m, nil
 		}
@@ -1397,6 +1585,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lastSelected2Path = ""
 				return m, nil
 			}
+			stopAudio(&m.audioPlayer)
 			return m, tea.Quit
 
 		case key.Matches(msg, keyMap.Copy):
@@ -2256,6 +2445,8 @@ func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
 			} else {
 				return m, m.openImageModal(entry.Path)
 			}
+		} else if appfs.IsAudio(entry.Name) {
+			return m, m.openAudioModal(entry.Path)
 		} else if appfs.IsText(entry.Path) {
 			editor := defaultEditor()
 			if editor != "" {
@@ -2373,6 +2564,8 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			} else {
 				return m, m.openImageModal(entry.Path)
 			}
+		} else if appfs.IsAudio(entry.Name) {
+			return m, m.openAudioModal(entry.Path)
 		} else if appfs.IsText(entry.Path) {
 			editor := defaultEditor()
 			if editor != "" {
@@ -2519,6 +2712,8 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 			} else {
 				return m, m.openImageModal(entry.Path)
 			}
+		} else if appfs.IsAudio(entry.Name) {
+			return m, m.openAudioModal(entry.Path)
 		} else if appfs.IsText(entry.Path) {
 			editor := defaultEditor()
 			if editor != "" {
@@ -2649,6 +2844,10 @@ func (m Model) View() string {
 		return m.renderImageModal()
 	}
 
+	if m.audioPlayer.open {
+		return m.renderAudioModal()
+	}
+
 	view := m.renderNormal()
 
 	if kitty.IsSupported() {
@@ -2727,6 +2926,73 @@ func (m Model) renderImageModal() string {
 		out += kitty.Place(m.imageModal.encoded, col, row, c, r, 2)
 	}
 	return out
+}
+
+func (m Model) renderAudioModal() string {
+	a := m.audioPlayer
+	const modalW = 60
+	modalH := 9
+
+	innerW := modalW - 4 // border(2) + padding(2)
+
+	// Title line.
+	title := StyleSelected.Bold(true).Render(" 󰎇  " + a.name)
+
+	// Time display.
+	elMin := int(a.elapsed) / 60
+	elSec := int(a.elapsed) % 60
+	timeStr := fmt.Sprintf("%02d:%02d", elMin, elSec)
+	var durStr string
+	if a.dur > 0 {
+		dMin := int(a.dur) / 60
+		dSec := int(a.dur) % 60
+		durStr = fmt.Sprintf(" / %02d:%02d", dMin, dSec)
+	}
+	timeLine := StyleDim.Render(timeStr) + StyleDim.Render(durStr)
+
+	// Progress bar.
+	barW := innerW - 4
+	if barW < 4 {
+		barW = 4
+	}
+	var progressBar string
+	if a.dur > 0 {
+		filled := int(float64(barW) * a.elapsed / a.dur)
+		if filled > barW {
+			filled = barW
+		}
+		progressBar = StyleSelected.Render(strings.Repeat("█", filled)) +
+			StyleDim.Render(strings.Repeat("░", barW-filled))
+	} else {
+		// Spinning indicator when duration is unknown.
+		spinners := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		spin := spinners[int(a.elapsed)%len(spinners)]
+		progressBar = StyleDim.Render(spin + " " + strings.Repeat("─", barW-2))
+	}
+
+	// Status icon.
+	var statusIcon string
+	if a.proc == nil {
+		statusIcon = StyleDim.Render("󰙧  finished")
+	} else if a.paused {
+		statusIcon = StyleDim.Render("  paused")
+	} else {
+		statusIcon = StyleSelected.Render("  playing")
+	}
+
+	hint := StyleDim.Render("  space/p  pause    q  close")
+
+	lines := []string{
+		title,
+		"",
+		"  " + progressBar,
+		"  " + timeLine + "   " + statusIcon,
+		"",
+		hint,
+	}
+
+	box := StylePaneActive.Width(innerW).Height(modalH).Render(strings.Join(lines, "\n"))
+	return m.overlayModal(box)
 }
 
 func (m Model) renderNormal() string {

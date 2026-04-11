@@ -50,6 +50,16 @@ func IsHidden(name string) bool {
 	return strings.HasPrefix(name, ".")
 }
 
+// IsAudio reports whether the file extension is a common audio format.
+func IsAudio(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp3", ".flac", ".ogg", ".wav", ".aac", ".m4a", ".opus",
+		".wma", ".aiff", ".aif", ".ape", ".wv", ".mka":
+		return true
+	}
+	return false
+}
+
 // IsImage reports whether the file extension is a common raster image format.
 func IsImage(name string) bool {
 	switch strings.ToLower(filepath.Ext(name)) {
