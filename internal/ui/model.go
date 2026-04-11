@@ -182,6 +182,246 @@ type newItemModal struct {
 }
 
 // ---------------------------------------------------------------------------
+// Command palette
+// ---------------------------------------------------------------------------
+
+type paletteCmd struct {
+	icon  string
+	label string
+	run   func(m Model) (Model, tea.Cmd)
+}
+
+type paletteModel struct {
+	open   bool
+	query  string
+	cursor int
+}
+
+// allPaletteCommands is the full registry of palette actions.
+var allPaletteCommands = []paletteCmd{
+	{"󰋜", "Go home", func(m Model) (Model, tea.Cmd) {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			if m.focus == focusSplit {
+				m.cwd2 = home
+				m.cursor2 = 0
+				m.offset2 = 0
+				m.entries2, _ = m.loadEntries2()
+			} else {
+				m.cwd = home
+				m.cursor = 0
+				m.offset = 0
+				m.entries, m.err = m.loadEntries()
+			}
+		}
+		return m, m.maybeLoadPreview()
+	}},
+	{"󰆏", "Copy", func(m Model) (Model, tea.Cmd) {
+		av := m.activeVisible()
+		if len(av) > 0 {
+			sel := m.activeSelectedPaths()
+			var items []clipItem
+			for _, e := range av {
+				if sel[e.Path] {
+					items = append(items, clipItem{path: e.Path, name: e.Name})
+				}
+			}
+			if len(items) == 0 {
+				e := av[m.activeCursor()]
+				items = []clipItem{{path: e.Path, name: e.Name}}
+			}
+			m.clipboard = fileClipboard{op: clipCopy, items: items}
+			if len(items) == 1 {
+				m.statusMsg = fmt.Sprintf("copied  %s", items[0].name)
+			} else {
+				m.statusMsg = fmt.Sprintf("copied  %d items", len(items))
+			}
+		}
+		return m, nil
+	}},
+	{"󰆐", "Cut", func(m Model) (Model, tea.Cmd) {
+		av := m.activeVisible()
+		if len(av) > 0 {
+			sel := m.activeSelectedPaths()
+			var items []clipItem
+			for _, e := range av {
+				if sel[e.Path] {
+					items = append(items, clipItem{path: e.Path, name: e.Name})
+				}
+			}
+			if len(items) == 0 {
+				e := av[m.activeCursor()]
+				items = []clipItem{{path: e.Path, name: e.Name}}
+			}
+			m.clipboard = fileClipboard{op: clipCut, items: items}
+			if len(items) == 1 {
+				m.statusMsg = fmt.Sprintf("cut  %s", items[0].name)
+			} else {
+				m.statusMsg = fmt.Sprintf("cut  %d items", len(items))
+			}
+		}
+		return m, nil
+	}},
+	{"󰆒", "Paste", func(m Model) (Model, tea.Cmd) {
+		if m.clipboard.op != clipNone && len(m.clipboard.items) > 0 {
+			var lastErr error
+			pasteCount := len(m.clipboard.items)
+			var lastName string
+			for _, item := range m.clipboard.items {
+				dst := filepath.Join(m.activeCwd(), item.name)
+				var err error
+				if m.clipboard.op == clipCopy {
+					err = appfs.CopyEntry(item.path, dst)
+				} else {
+					err = appfs.MoveEntry(item.path, dst)
+				}
+				if err != nil {
+					lastErr = err
+				} else {
+					lastName = item.name
+				}
+			}
+			if m.clipboard.op == clipCut {
+				m.clipboard = fileClipboard{}
+			}
+			if lastErr != nil {
+				m.statusMsg = fmt.Sprintf("error: %v", lastErr)
+			} else if pasteCount == 1 {
+				m.statusMsg = fmt.Sprintf("pasted  %s", lastName)
+			} else {
+				m.statusMsg = fmt.Sprintf("pasted  %d items", pasteCount)
+			}
+			if m.focus == focusSplit {
+				m.entries2, _ = m.loadEntries2()
+			} else {
+				m.entries, _ = m.loadEntries()
+			}
+		}
+		return m, m.maybeLoadPreview()
+	}},
+	{"󰅎", "Delete", func(m Model) (Model, tea.Cmd) {
+		visible := m.activeVisible()
+		if m.focus != focusSidebar && len(visible) > 0 {
+			sel := m.activeSelectedPaths()
+			if len(sel) > 0 {
+				var targets []appfs.Entry
+				for _, e := range visible {
+					if sel[e.Path] {
+						targets = append(targets, e)
+					}
+				}
+				if len(targets) > 0 {
+					m.deleteConfirm = deleteModal{open: true, target: targets[0], multiTargets: targets}
+				}
+			} else {
+				m.deleteConfirm = deleteModal{open: true, target: visible[m.activeCursor()]}
+			}
+			m.statusMsg = ""
+		}
+		return m, nil
+	}},
+	{"󰉋", "New folder", func(m Model) (Model, tea.Cmd) {
+		if m.focus != focusSidebar {
+			m.newItem = newItemModal{open: true, kind: newItemDir}
+			m.statusMsg = ""
+		}
+		return m, nil
+	}},
+	{"󰈔", "New file", func(m Model) (Model, tea.Cmd) {
+		if m.focus != focusSidebar {
+			m.newItem = newItemModal{open: true, kind: newItemFile}
+			m.statusMsg = ""
+		}
+		return m, nil
+	}},
+	{"󰍉", "Search", func(m Model) (Model, tea.Cmd) {
+		if m.focus != focusSplit {
+			m.search.active = true
+			m.search.query = ""
+			m.cursor = 0
+			m.offset = 0
+			m.statusMsg = ""
+		}
+		return m, nil
+	}},
+	{"󰋞", "Go to path", func(m Model) (Model, tea.Cmd) {
+		m.goTo = goToModal{open: true, query: m.activeCwd()}
+		return m, nil
+	}},
+	{"󱏻", "Toggle split pane", func(m Model) (Model, tea.Cmd) {
+		if m.showSplit {
+			m.showSplit = false
+			if m.focus == focusSplit {
+				m.focus = focusList
+			}
+		} else {
+			m.showSplit = true
+			m.cwd2 = m.cwd
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+			m.focus = focusSplit
+		}
+		return m, nil
+	}},
+	{"󰈙", "Toggle details panel", func(m Model) (Model, tea.Cmd) {
+		m.showDetails = !m.showDetails
+		if !m.showDetails {
+			m.previewPath = ""
+			m.previewEncoded = ""
+		}
+		_ = appconfig.Save(appconfig.Config{ShowDetails: m.showDetails, ShowHidden: m.showHidden})
+		return m, m.maybeLoadPreview()
+	}},
+	{"󰈉", "Toggle hidden files", func(m Model) (Model, tea.Cmd) {
+		m.showHidden = !m.showHidden
+		m.cursor = 0
+		m.offset = 0
+		m.entries, m.err = m.loadEntries()
+		if m.showSplit {
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.entries2, _ = m.loadEntries2()
+		}
+		_ = appconfig.Save(appconfig.Config{ShowDetails: m.showDetails, ShowHidden: m.showHidden})
+		return m, m.maybeLoadPreview()
+	}},
+	{"󰀼", "Toggle favorite", func(m Model) (Model, tea.Cmd) {
+		av := m.activeVisible()
+		if len(av) > 0 {
+			e := av[m.activeCursor()]
+			if e.IsDir {
+				wasFav := m.isFavorite(e.Path)
+				m.toggleFavorite(e.Path)
+				if wasFav {
+					m.statusMsg = fmt.Sprintf("removed from favorites  %s", e.Name)
+				} else {
+					m.statusMsg = fmt.Sprintf("added to favorites  %s", e.Name)
+				}
+			}
+		}
+		return m, nil
+	}},
+	{"󰗼", "Quit", func(m Model) (Model, tea.Cmd) {
+		return m, tea.Quit
+	}},
+}
+
+func paletteFilter(query string) []paletteCmd {
+	if query == "" {
+		return allPaletteCommands
+	}
+	q := strings.ToLower(query)
+	var out []paletteCmd
+	for _, c := range allPaletteCommands {
+		if strings.Contains(strings.ToLower(c.label), q) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
 
@@ -526,6 +766,7 @@ var keyMap = struct {
 	MarkSelectRange       key.Binding
 	NewDir                key.Binding
 	NewFile               key.Binding
+	Palette               key.Binding
 }{
 	Up:              key.NewBinding(key.WithKeys("up", "k")),
 	Down:            key.NewBinding(key.WithKeys("down", "j")),
@@ -549,6 +790,7 @@ var keyMap = struct {
 	MarkSelectRange: key.NewBinding(key.WithKeys("V")),
 	NewDir:          key.NewBinding(key.WithKeys("n")),
 	NewFile:         key.NewBinding(key.WithKeys("N")),
+	Palette:         key.NewBinding(key.WithKeys("f1")),
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +819,7 @@ type Model struct {
 	deleteConfirm  deleteModal
 	goTo           goToModal
 	newItem        newItemModal
+	palette        paletteModel
 	imageModal     imageModalState
 	search         searchModel
 	showDetails    bool
@@ -911,6 +1154,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// Command palette captures all input while open.
+		if m.palette.open {
+			var cmd tea.Cmd
+			m, cmd = m.updatePalette(msg)
+			return m, cmd
+		}
+
 		// Search captures most input while active.
 		if m.search.active {
 			var searchCmd tea.Cmd
@@ -1071,6 +1321,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.newItem = newItemModal{open: true, kind: newItemFile}
 				m.statusMsg = ""
 			}
+
+		case key.Matches(msg, keyMap.Palette):
+			m.palette = paletteModel{open: true}
+			m.statusMsg = ""
 
 		case key.Matches(msg, keyMap.ToggleSplit):
 			if m.showSplit {
@@ -1441,6 +1695,229 @@ func (m Model) updateNewItemModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.newItem.query += " "
 	}
 	return m, nil
+}
+
+func (m Model) updatePalette(msg tea.KeyMsg) (Model, tea.Cmd) {
+	filtered := paletteFilter(m.palette.query)
+	switch msg.Type {
+	case tea.KeyEnter:
+		if len(filtered) > 0 {
+			cmd := filtered[m.palette.cursor]
+			m.palette = paletteModel{}
+			return cmd.run(m)
+		}
+		m.palette = paletteModel{}
+
+	case tea.KeyEsc:
+		m.palette = paletteModel{}
+
+	case tea.KeyUp:
+		if m.palette.cursor > 0 {
+			m.palette.cursor--
+		}
+
+	case tea.KeyDown:
+		if m.palette.cursor < len(filtered)-1 {
+			m.palette.cursor++
+		}
+
+	case tea.KeyBackspace:
+		runes := []rune(m.palette.query)
+		if len(runes) > 0 {
+			m.palette.query = string(runes[:len(runes)-1])
+			// clamp cursor
+			f := paletteFilter(m.palette.query)
+			if m.palette.cursor >= len(f) {
+				m.palette.cursor = max(0, len(f)-1)
+			}
+		}
+
+	case tea.KeyRunes:
+		m.palette.query += string(msg.Runes)
+		m.palette.cursor = 0
+	}
+	return m, nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// overlayCenter composites the overlay string centered on top of bg.
+// Both are assumed to be rendered terminal strings (may contain ANSI escapes).
+// bg is split into lines; overlay lines replace the corresponding bg lines.
+func overlayCenter(bg, overlay string, bgW, bgH int) string {
+	bgLines := strings.Split(bg, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+
+	oH := len(overlayLines)
+	oW := lipgloss.Width(overlayLines[0])
+	if oW == 0 && len(overlayLines) > 0 {
+		// measure the widest line
+		for _, l := range overlayLines {
+			if w := lipgloss.Width(l); w > oW {
+				oW = w
+			}
+		}
+	}
+
+	startRow := (bgH - oH) / 2
+	startCol := (bgW - oW) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	if startCol < 0 {
+		startCol = 0
+	}
+
+	// Ensure bg has enough lines.
+	for len(bgLines) < startRow+oH {
+		bgLines = append(bgLines, "")
+	}
+
+	for i, ol := range overlayLines {
+		row := startRow + i
+		if row >= len(bgLines) {
+			break
+		}
+		bgLines[row] = insertAt(bgLines[row], ol, startCol)
+	}
+	return strings.Join(bgLines, "\n")
+}
+
+// insertAt replaces the visible characters of dst starting at column col with src.
+// It handles ANSI-escaped strings by working in terms of printable-cell width.
+func insertAt(dst, src string, col int) string {
+	// Convert to rune slice for indexing, strip ANSI for width accounting.
+	// Strategy: walk dst runes tracking visible column; rebuild with src spliced in.
+	srcW := lipgloss.Width(src)
+	dstW := lipgloss.Width(dst)
+
+	// If dst is shorter than needed, right-pad with spaces.
+	if dstW < col {
+		dst += strings.Repeat(" ", col-dstW)
+	}
+
+	// We work on the raw bytes of dst but need visible-cell positions.
+	// Use a simple approach: rebuild left + src + right portions.
+	left := visibleTrunc(dst, col)
+	leftW := lipgloss.Width(left)
+	// Account for any shortfall from wide chars landing on the boundary.
+	if leftW < col {
+		left += strings.Repeat(" ", col-leftW)
+	}
+
+	// Skip dstW chars that src will overwrite.
+	right := visibleSkip(dst, col+srcW)
+
+	return left + src + right
+}
+
+// visibleTrunc returns the prefix of s whose visible width is <= n.
+func visibleTrunc(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	// Strip ANSI and count; but we want to preserve ANSI codes in output.
+	// Simple approach: use lipgloss to truncate.
+	return lipgloss.NewStyle().MaxWidth(n).Render(s)
+}
+
+// visibleSkip returns the suffix of s after skipping n visible columns.
+func visibleSkip(s string, n int) string {
+	plain := stripANSI(s)
+	col := 0
+	for i, r := range plain {
+		if col >= n {
+			return plain[i:]
+		}
+		col += runeWidth(r)
+	}
+	return ""
+}
+
+func stripANSI(s string) string {
+	var b strings.Builder
+	esc := false
+	for _, r := range s {
+		if r == '\x1b' {
+			esc = true
+			continue
+		}
+		if esc {
+			if r == 'm' {
+				esc = false
+			}
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func runeWidth(r rune) int {
+	if r >= 0x1100 && (r <= 0x115f || r == 0x2329 || r == 0x232a ||
+		(r >= 0x2e80 && r <= 0x3247) || (r >= 0x3250 && r <= 0x4dbf) ||
+		(r >= 0x4e00 && r <= 0xa4c6) || (r >= 0xa960 && r <= 0xa97c) ||
+		(r >= 0xac00 && r <= 0xd7a3) || (r >= 0xf900 && r <= 0xfaff) ||
+		(r >= 0xfe10 && r <= 0xfe19) || (r >= 0xfe30 && r <= 0xfe6b) ||
+		(r >= 0xff01 && r <= 0xff60) || (r >= 0xffe0 && r <= 0xffe6) ||
+		(r >= 0x1b000 && r <= 0x1b001) || (r >= 0x1f200 && r <= 0x1f251) ||
+		(r >= 0x1f300 && r <= 0x1f64f) || (r >= 0x20000 && r <= 0x2fffd) ||
+		(r >= 0x30000 && r <= 0x3fffd)) {
+		return 2
+	}
+	return 1
+}
+
+func (m Model) renderPalette() string {
+	const modalW = 52
+	const maxVisible = 10
+
+	filtered := paletteFilter(m.palette.query)
+
+	label := StyleDim.Render("Command palette")
+	input := StyleNormal.Render(m.palette.query) + StyleCursor.Render(" ")
+	hint := StyleDim.Render("↑/↓ navigate   enter  run   esc  close")
+
+	var rows []string
+	rows = append(rows, "", label, input, "")
+
+	if len(filtered) == 0 {
+		rows = append(rows, StyleDim.Render("  no matching commands"))
+	} else {
+		start := 0
+		if m.palette.cursor >= maxVisible {
+			start = m.palette.cursor - maxVisible + 1
+		}
+		end := start + maxVisible
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		innerW := modalW - 4
+		for i := start; i < end; i++ {
+			c := filtered[i]
+			line := fmt.Sprintf("  %s  %s", c.icon, c.label)
+			if i == m.palette.cursor {
+				rows = append(rows, StyleCursor.Width(innerW).Render(line))
+			} else {
+				rows = append(rows, StyleNormal.MaxWidth(innerW).Render(line))
+			}
+		}
+	}
+
+	rows = append(rows, "", hint, "")
+	box := StylePaneActive.Width(modalW).Render(strings.Join(rows, "\n"))
+
+	bg := m.renderNormal()
+	out := overlayCenter(bg, box, m.width, m.height)
+	if kitty.IsSupported() {
+		out += kitty.ClearAll()
+	}
+	return out
 }
 
 func (m Model) updateGoToModal(msg tea.KeyMsg) (Model, tea.Cmd) {
@@ -1932,6 +2409,10 @@ func (m Model) View() string {
 		return m.renderNewItemModal()
 	}
 
+	if m.palette.open {
+		return m.renderPalette()
+	}
+
 	if m.imageModal.open {
 		return m.renderImageModal()
 	}
@@ -1947,6 +2428,17 @@ func (m Model) View() string {
 	}
 
 	return view
+}
+
+// overlayModal renders box centered over the normal background view.
+// It also clears kitty images. Use for all popup modals.
+func (m Model) overlayModal(box string) string {
+	bg := m.renderNormal()
+	out := overlayCenter(bg, box, m.width, m.height)
+	if kitty.IsSupported() {
+		out += kitty.ClearAll()
+	}
+	return out
 }
 
 func (m Model) renderImageModal() string {
@@ -1988,7 +2480,7 @@ func (m Model) renderImageModal() string {
 	lines = append(lines, StyleDim.Render("  ←/→ cycle    q  close"))
 
 	box := StylePaneActive.Width(innerW).Height(innerH).Render(strings.Join(lines, "\n"))
-	out := lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	out := overlayCenter(m.renderNormal(), box, m.width, m.height)
 
 	// Kitty image is placed on top of the box using absolute terminal coordinates.
 	// col/row are 1-based. Offset 3 = border(1)+padding(1)+1-based(1) for col;
@@ -2036,10 +2528,6 @@ func (m Model) renderNormal() string {
 }
 
 func (m Model) renderDeleteModal() string {
-	clear := ""
-	if kitty.IsSupported() {
-		clear = kitty.ClearAll()
-	}
 	target := m.deleteConfirm.target
 	multi := m.deleteConfirm.multiTargets
 	const modalW = 46
@@ -2065,15 +2553,10 @@ func (m Model) renderDeleteModal() string {
 
 	content := strings.Join([]string{"", warning, nameLine, "", confirm, ""}, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
-	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return m.overlayModal(box)
 }
 
 func (m Model) renderNewItemModal() string {
-	clear := ""
-	if kitty.IsSupported() {
-		clear = kitty.ClearAll()
-	}
-
 	const modalW = 50
 	var label string
 	if m.newItem.kind == newItemDir {
@@ -2091,29 +2574,20 @@ func (m Model) renderNewItemModal() string {
 	lines = append(lines, hint, "")
 	content := strings.Join(lines, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
-	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return m.overlayModal(box)
 }
 
 func (m Model) renderGoToModal() string {
-	clear := ""
-	if kitty.IsSupported() {
-		clear = kitty.ClearAll()
-	}
-
 	const modalW = 60
 	label := StyleDim.Render("Go to path:")
 	input := StyleNormal.Render(m.goTo.query) + StyleCursor.Render(" ")
 	hint := StyleDim.Render("enter  confirm   esc  cancel")
 	content := strings.Join([]string{"", label, input, "", hint, ""}, "\n")
 	box := StylePaneActive.Width(modalW).Render(content)
-	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return m.overlayModal(box)
 }
 
 func (m Model) renderWithOverlay() string {
-	clear := ""
-	if kitty.IsSupported() {
-		clear = kitty.ClearAll()
-	}
 	const menuW = 26
 
 	var rows []string
@@ -2138,7 +2612,7 @@ func (m Model) renderWithOverlay() string {
 	hint := StyleDim.Render("  j/k navigate  enter select  esc close")
 	content := lipgloss.JoinVertical(lipgloss.Center, menuBox, hint)
 
-	return clear + lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+	return m.overlayModal(content)
 }
 
 func (m Model) renderSidebar(height int) string {
