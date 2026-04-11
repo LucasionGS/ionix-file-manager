@@ -944,7 +944,8 @@ type Model struct {
 	previewW       int
 	previewH       int
 	previewCache   map[string]imageModalCacheEntry // reuses imageModalCacheEntry: encoded+dims
-	pendingSelect  string                          // filename to select on first WindowSizeMsg
+	pendingSelect    string // filename to select on first WindowSizeMsg
+	pendingOpenImage bool   // open image modal on first WindowSizeMsg
 
 	showSplit bool
 	cwd2      string
@@ -1031,6 +1032,9 @@ func New(startDir, selectName string) Model {
 			if e.Name == selectName {
 				m.cursor = i
 				m.pendingSelect = selectName
+				if !e.IsDir && appfs.IsImage(e.Name) {
+					m.pendingOpenImage = true
+				}
 				break
 			}
 		}
@@ -1178,6 +1182,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.offset = m.cursor - listH/2
 			}
 			m.pendingSelect = ""
+		}
+		if m.pendingOpenImage && m.cursor >= 0 && m.cursor < len(m.entries) {
+			m.pendingOpenImage = false
+			e := m.entries[m.cursor]
+			imgCmd := m.openImageModal(e.Path)
+			return m, tea.Batch(m.maybeLoadPreview(), imgCmd)
 		}
 		return m, m.maybeLoadPreview()
 
