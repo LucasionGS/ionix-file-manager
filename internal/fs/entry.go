@@ -78,8 +78,9 @@ func IsText(path string) bool {
 	defer f.Close()
 	buf := make([]byte, 512)
 	n, _ := f.Read(buf)
+	// 0-byte files are valid text files (no binary content).
 	if n == 0 {
-		return false
+		return true
 	}
 	for _, b := range buf[:n] {
 		if b == 0 {
