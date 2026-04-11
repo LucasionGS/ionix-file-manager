@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
+	"image/gif"
 	"image/png"
 	"math"
 	"os"
@@ -11,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/LucasionGS/ionix-file-manager/internal/clipboard"
 	appconfig "github.com/LucasionGS/ionix-file-manager/internal/config"
@@ -558,25 +562,41 @@ func loadPreviewCmd(path string) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 type imageModalCacheEntry struct {
-	encoded string
-	imgW    int
-	imgH    int
+	encoded   string          // base64 PNG (static or first frame)
+	frames    []string        // base64 PNG per frame (animated GIF only)
+	frameDurs []time.Duration // per-frame delays (animated GIF only)
+	imgW      int
+	imgH      int
 }
 
 type imageModalState struct {
 	open    bool
 	path    string
-	encoded string // base64-encoded PNG, "" while loading
+	encoded string // base64 PNG shown in render (updated per-frame for GIFs)
 	imgW    int
 	imgH    int
 	cache   map[string]imageModalCacheEntry
+	// GIF animation
+	frames       []string
+	frameDurs    []time.Duration
+	currentFrame int
+	isAnimated   bool
+}
+
+// gifTickMsg is sent by the animation ticker to advance one frame.
+type gifTickMsg struct{ path string }
+
+func gifTickCmd(path string, d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(_ time.Time) tea.Msg { return gifTickMsg{path: path} })
 }
 
 type imageModalLoadedMsg struct {
-	path    string
-	encoded string
-	imgW    int
-	imgH    int
+	path      string
+	encoded   string
+	frames    []string
+	frameDurs []time.Duration
+	imgW      int
+	imgH      int
 }
 
 // imageModalMaxPx is the longest edge (in pixels) we scale modal images down to.
@@ -589,6 +609,13 @@ func loadImageModalCmd(path string) tea.Cmd {
 		if err != nil {
 			return imageModalLoadedMsg{path: path}
 		}
+		// Try animated GIF first.
+		if strings.ToLower(filepath.Ext(path)) == ".gif" {
+			if msg := loadGIFFrames(path, data); msg != nil {
+				return *msg
+			}
+		}
+		// Static image fallback.
 		img, _, err := image.Decode(bytes.NewReader(data))
 		if err != nil {
 			return imageModalLoadedMsg{path: path}
@@ -608,6 +635,79 @@ func loadImageModalCmd(path string) tea.Cmd {
 	}
 }
 
+// loadGIFFrames decodes a GIF and returns a fully-populated imageModalLoadedMsg,
+// or nil if the GIF has only one frame (treat as static).
+func loadGIFFrames(path string, data []byte) *imageModalLoadedMsg {
+	g, err := gif.DecodeAll(bytes.NewReader(data))
+	if err != nil || len(g.Image) <= 1 {
+		return nil
+	}
+	cw, ch := g.Config.Width, g.Config.Height
+	if cw == 0 {
+		cw = g.Image[0].Bounds().Max.X
+	}
+	if ch == 0 {
+		ch = g.Image[0].Bounds().Max.Y
+	}
+
+	// Composite frames onto a canvas respecting disposal methods.
+	canvas := image.NewRGBA(image.Rect(0, 0, cw, ch))
+	prevCanvas := image.NewRGBA(image.Rect(0, 0, cw, ch))
+
+	// Fill canvas with the GIF background colour.
+	if int(g.BackgroundIndex) < len(g.Image[0].Palette) {
+		bg := g.Image[0].Palette[g.BackgroundIndex]
+		draw.Draw(canvas, canvas.Bounds(), &image.Uniform{bg}, image.Point{}, draw.Src)
+	}
+
+	var frames []string
+	var durs []time.Duration
+	for i, frame := range g.Image {
+		// Save canvas before drawing for DisposalPrevious.
+		copy(prevCanvas.Pix, canvas.Pix)
+
+		// Composite this frame.
+		draw.Draw(canvas, frame.Rect, frame, frame.Rect.Min, draw.Over)
+
+		// Encode the composited canvas as PNG.
+		scaled := scaleDown(canvas, imageModalMaxPx, imageModalMaxPx)
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, scaled); err != nil {
+			continue
+		}
+		frames = append(frames, kitty.Encode(buf.Bytes()))
+
+		delay := g.Delay[i]
+		if delay <= 0 {
+			delay = 10 // default 100ms
+		}
+		durs = append(durs, time.Duration(delay)*10*time.Millisecond)
+
+		// Apply disposal for next frame.
+		switch g.Disposal[i] {
+		case gif.DisposalBackground:
+			draw.Draw(canvas, frame.Rect, &image.Uniform{color.RGBA{0, 0, 0, 0}}, image.Point{}, draw.Src)
+		case gif.DisposalPrevious:
+			copy(canvas.Pix, prevCanvas.Pix)
+			// DisposalNone / default: leave canvas as-is.
+		}
+	}
+
+	if len(frames) == 0 {
+		return nil
+	}
+
+	b := canvas.Bounds()
+	return &imageModalLoadedMsg{
+		path:      path,
+		encoded:   frames[0],
+		frames:    frames,
+		frameDurs: durs,
+		imgW:      b.Dx(),
+		imgH:      b.Dy(),
+	}
+}
+
 // openImageModal initialises the modal for path, re-using any existing cache,
 // and kicks off a load + neighbour preload.
 func (m *Model) openImageModal(path string) tea.Cmd {
@@ -624,6 +724,14 @@ func (m *Model) openImageModal(path string) tea.Cmd {
 			imgH:    ce.imgH,
 			cache:   cache,
 		}
+		var tickCmd tea.Cmd
+		if len(ce.frames) > 1 {
+			m.imageModal.frames = ce.frames
+			m.imageModal.frameDurs = ce.frameDurs
+			m.imageModal.currentFrame = 0
+			m.imageModal.isAnimated = true
+			tickCmd = gifTickCmd(path, ce.frameDurs[0])
+		}
 		// Still preload neighbours.
 		visible := m.visibleEntries()
 		var imgIndices []int
@@ -634,10 +742,10 @@ func (m *Model) openImageModal(path string) tea.Cmd {
 		}
 		for ci, idx := range imgIndices {
 			if visible[idx].Path == path {
-				return m.preloadNeighbours(imgIndices, ci, visible)
+				return tea.Batch(tickCmd, m.preloadNeighbours(imgIndices, ci, visible))
 			}
 		}
-		return nil
+		return tickCmd
 	}
 	m.imageModal = imageModalState{open: true, path: path, cache: cache}
 	return loadImageModalCmd(path)
@@ -684,8 +792,16 @@ func (m *Model) imageModalStep(delta int) tea.Cmd {
 			imgH:    ce.imgH,
 			cache:   cache,
 		}
+		var tickCmd tea.Cmd
+		if len(ce.frames) > 1 {
+			m.imageModal.frames = ce.frames
+			m.imageModal.frameDurs = ce.frameDurs
+			m.imageModal.currentFrame = 0
+			m.imageModal.isAnimated = true
+			tickCmd = gifTickCmd(entry.Path, ce.frameDurs[0])
+		}
 		// Pre-load neighbours in the background.
-		return m.preloadNeighbours(imgIndices, next, visible)
+		return tea.Batch(tickCmd, m.preloadNeighbours(imgIndices, next, visible))
 	}
 	m.imageModal = imageModalState{open: true, path: entry.Path, cache: cache}
 	return tea.Batch(loadImageModalCmd(entry.Path), m.preloadNeighbours(imgIndices, next, visible))
@@ -1088,15 +1204,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.imageModal.cache = make(map[string]imageModalCacheEntry)
 			}
 			m.imageModal.cache[msg.path] = imageModalCacheEntry{
-				encoded: msg.encoded,
-				imgW:    msg.imgW,
-				imgH:    msg.imgH,
+				encoded:   msg.encoded,
+				frames:    msg.frames,
+				frameDurs: msg.frameDurs,
+				imgW:      msg.imgW,
+				imgH:      msg.imgH,
 			}
 			if msg.path == m.imageModal.path {
 				m.imageModal.encoded = msg.encoded
 				m.imageModal.imgW = msg.imgW
 				m.imageModal.imgH = msg.imgH
+				if len(msg.frames) > 1 {
+					m.imageModal.frames = msg.frames
+					m.imageModal.frameDurs = msg.frameDurs
+					m.imageModal.currentFrame = 0
+					m.imageModal.isAnimated = true
+					return m, gifTickCmd(msg.path, msg.frameDurs[0])
+				}
 			}
+		}
+		return m, nil
+
+	case gifTickMsg:
+		if m.imageModal.open && m.imageModal.isAnimated && m.imageModal.path == msg.path {
+			next := (m.imageModal.currentFrame + 1) % len(m.imageModal.frames)
+			m.imageModal.currentFrame = next
+			m.imageModal.encoded = m.imageModal.frames[next]
+			return m, gifTickCmd(msg.path, m.imageModal.frameDurs[next])
 		}
 		return m, nil
 
