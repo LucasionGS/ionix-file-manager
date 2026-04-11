@@ -9,6 +9,7 @@ import (
 	"image/gif"
 	"image/png"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -670,14 +671,17 @@ func gifTickCmd(path string, d time.Duration) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 type audioModal struct {
-	open     bool
-	path     string
-	name     string  // display name
-	dur      float64 // total duration in seconds (0 = unknown)
-	elapsed  float64 // seconds played
-	paused   bool
-	proc     *exec.Cmd
-	playerOK bool // a suitable player was found
+	open       bool
+	path       string
+	name       string  // display name
+	dur        float64 // total duration in seconds (0 = unknown)
+	elapsed    float64 // seconds played
+	paused     bool
+	proc       *exec.Cmd
+	playerOK   bool   // a suitable player was found
+	playerBin  string // "mpv" or "ffplay"
+	ipcSocket  string // mpv IPC socket path
+	generation int    // incremented on each new process; guards audioFinishedMsg
 }
 
 // audioTickMsg fires every second while audio is playing.
@@ -717,27 +721,45 @@ func probeDurationCmd(path string) tea.Cmd {
 
 // audioPlayer returns a ready-to-start *exec.Cmd for the best available player,
 // or nil if none is found.  The process must be started with Start() (not Run()).
-func audioPlayer(path string) *exec.Cmd {
-	// Prefer mpv (headless), then ffplay (shows nothing without -nodisp).
-	if bin, err := exec.LookPath("mpv"); err == nil {
-		cmd := exec.Command(bin,
+// buildAudioCmd creates a player command for path starting at startAt seconds.
+// Returns (cmd, playerBin, ipcSocketPath); ipcSocketPath is set only for mpv.
+func buildAudioCmd(path string, startAt float64) (*exec.Cmd, string, string) {
+	if mpvBin, err := exec.LookPath("mpv"); err == nil {
+		sock := filepath.Join(os.TempDir(), fmt.Sprintf("ifm-mpv-%d.sock", os.Getpid()))
+		args := []string{
 			"--no-video",
 			"--quiet",
 			"--really-quiet",
-			path,
-		)
-		return cmd
+			fmt.Sprintf("--input-ipc-server=%s", sock),
+		}
+		if startAt > 0 {
+			args = append(args, fmt.Sprintf("--start=%.3f", startAt))
+		}
+		args = append(args, path)
+		return exec.Command(mpvBin, args...), "mpv", sock
 	}
-	if bin, err := exec.LookPath("ffplay"); err == nil {
-		cmd := exec.Command(bin,
-			"-nodisp",
-			"-autoexit",
-			"-loglevel", "quiet",
-			path,
-		)
-		return cmd
+	if ffplayBin, err := exec.LookPath("ffplay"); err == nil {
+		args := []string{"-nodisp", "-autoexit", "-loglevel", "quiet"}
+		if startAt > 0 {
+			args = append(args, "-ss", fmt.Sprintf("%.3f", startAt))
+		}
+		args = append(args, path)
+		return exec.Command(ffplayBin, args...), "ffplay", ""
 	}
-	return nil
+	return nil, "", ""
+}
+
+// seekMPVCmd sends a relative seek command to an mpv IPC socket.
+func seekMPVCmd(socketPath string, delta float64) tea.Cmd {
+	return func() tea.Msg {
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			return nil
+		}
+		defer conn.Close()
+		fmt.Fprintf(conn, `{"command":["seek",%g,"relative"]}`+"\n", delta)
+		return nil
+	}
 }
 
 // stopAudio kills the player process if one is running.
@@ -768,12 +790,15 @@ func resumeAudio(a *audioModal) {
 
 // audioPlayerFinishedCmd returns a command that waits for the player process
 // to finish, then sends an audioFinishedMsg.
-type audioFinishedMsg struct{ path string }
+type audioFinishedMsg struct {
+	path       string
+	generation int
+}
 
-func waitAudioCmd(path string, cmd *exec.Cmd) tea.Cmd {
+func waitAudioCmd(path string, cmd *exec.Cmd, gen int) tea.Cmd {
 	return func() tea.Msg {
 		_ = cmd.Wait()
-		return audioFinishedMsg{path: path}
+		return audioFinishedMsg{path: path, generation: gen}
 	}
 }
 
@@ -1024,7 +1049,7 @@ func (m *Model) openAudioModal(path string) tea.Cmd {
 	// Stop any current playback.
 	stopAudio(&m.audioPlayer)
 
-	cmd := audioPlayer(path)
+	cmd, bin, sock := buildAudioCmd(path, 0)
 	if cmd == nil {
 		m.statusMsg = "audio playback requires mpv or ffplay"
 		return nil
@@ -1033,18 +1058,66 @@ func (m *Model) openAudioModal(path string) tea.Cmd {
 		m.statusMsg = fmt.Sprintf("audio error: %v", err)
 		return nil
 	}
+	const gen = 1
 	m.audioPlayer = audioModal{
-		open:     true,
-		path:     path,
-		name:     filepath.Base(path),
-		proc:     cmd,
-		playerOK: true,
+		open:       true,
+		path:       path,
+		name:       filepath.Base(path),
+		proc:       cmd,
+		playerOK:   true,
+		playerBin:  bin,
+		ipcSocket:  sock,
+		generation: gen,
 	}
 	return tea.Batch(
 		audioTickCmd(path),
 		probeDurationCmd(path),
-		waitAudioCmd(path, cmd),
+		waitAudioCmd(path, cmd, gen),
 	)
+}
+
+// seekAudio seeks the current track by delta seconds (positive = forward).
+func (m *Model) seekAudio(delta float64) tea.Cmd {
+	a := &m.audioPlayer
+	if !a.open {
+		return nil
+	}
+	newElapsed := a.elapsed + delta
+	if newElapsed < 0 {
+		newElapsed = 0
+	}
+	if a.dur > 0 && newElapsed > a.dur {
+		newElapsed = a.dur
+	}
+	a.elapsed = newElapsed
+
+	// mpv: send IPC seek — no process restart needed.
+	if a.playerBin == "mpv" && a.ipcSocket != "" && a.proc != nil {
+		return seekMPVCmd(a.ipcSocket, delta)
+	}
+
+	// ffplay (no IPC): if paused, just update the counter for when it resumes.
+	// If playing, kill and restart at the new position.
+	if a.paused || a.proc == nil {
+		return nil
+	}
+	if a.proc.Process != nil {
+		_ = a.proc.Process.Kill()
+		_ = a.proc.Wait()
+		a.proc = nil
+	}
+	cmd, bin, sock := buildAudioCmd(a.path, newElapsed)
+	if cmd == nil {
+		return nil
+	}
+	if err := cmd.Start(); err != nil {
+		return nil
+	}
+	a.generation++
+	a.proc = cmd
+	a.playerBin = bin
+	a.ipcSocket = sock
+	return tea.Batch(waitAudioCmd(a.path, cmd, a.generation), audioTickCmd(a.path))
 }
 
 // scaleDown resizes src so neither dimension exceeds maxW×maxH, preserving
@@ -1479,7 +1552,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case audioFinishedMsg:
-		if m.audioPlayer.open && m.audioPlayer.path == msg.path {
+		if m.audioPlayer.open && m.audioPlayer.path == msg.path && m.audioPlayer.generation == msg.generation {
 			m.audioPlayer.proc = nil
 			// Leave modal open so user can see it finished; elapsed stays.
 			m.audioPlayer.paused = true
@@ -1529,6 +1602,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					pauseAudio(&m.audioPlayer)
 					m.audioPlayer.paused = true
 				}
+			case key.Matches(msg, keyMap.Left):
+				return m, m.seekAudio(-1)
+			case key.Matches(msg, keyMap.Right):
+				return m, m.seekAudio(1)
 			}
 			return m, nil
 		}
@@ -2980,7 +3057,7 @@ func (m Model) renderAudioModal() string {
 		statusIcon = StyleSelected.Render("  playing")
 	}
 
-	hint := StyleDim.Render("  space/p  pause    q  close")
+	hint := StyleDim.Render("  ←/→ seek 1s    space/p  pause    q  close")
 
 	lines := []string{
 		title,
