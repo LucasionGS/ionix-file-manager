@@ -535,7 +535,7 @@ var allPaletteCommands = []paletteCmd{
 			m.previewPath = ""
 			m.previewEncoded = ""
 		}
-		saveUIPrefs(m.showDetails, m.showHidden)
+		m.saveUIPrefs()
 		return m, m.maybeLoadPreview()
 	}},
 	{"󰈉", "Toggle hidden files", func(m Model) (Model, tea.Cmd) {
@@ -548,7 +548,7 @@ var allPaletteCommands = []paletteCmd{
 			m.offset2 = 0
 			m.reloadSplit()
 		}
-		saveUIPrefs(m.showDetails, m.showHidden)
+		m.saveUIPrefs()
 		return m, m.maybeLoadPreview()
 	}},
 	{"󰀼", "Toggle favorite", func(m Model) (Model, tea.Cmd) {
@@ -1416,12 +1416,13 @@ func (m *Model) toggleFavorite(path string) {
 	_ = appconfig.Save(cfg)
 }
 
-// saveUIPrefs patches ShowDetails and ShowHidden into the existing config and saves,
+// saveUIPrefs persists the current UI toggle states to the config file,
 // preserving Colors, Favorites, and any other fields.
-func saveUIPrefs(showDetails, showHidden bool) {
+func (m Model) saveUIPrefs() {
 	cfg, _ := appconfig.Load()
-	cfg.ShowDetails = showDetails
-	cfg.ShowHidden = showHidden
+	cfg.ShowDetails = m.showDetails
+	cfg.ShowHidden = m.showHidden
+	cfg.ShowGitPane = m.showGitPane
 	_ = appconfig.Save(cfg)
 }
 
@@ -1432,6 +1433,7 @@ func New(startDir, selectName string) Model {
 		cwd:          filepath.Clean(startDir),
 		showHidden:   cfg.ShowHidden,
 		showDetails:  cfg.ShowDetails,
+		showGitPane:  cfg.ShowGitPane,
 		kittySupport: kitty.IsSupported(),
 		focus:        focusList,
 		bookmarks:    buildBookmarks(),
@@ -1909,10 +1911,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.previewPath = ""
 				m.previewEncoded = ""
 			}
-			saveUIPrefs(m.showDetails, m.showHidden)
+			m.saveUIPrefs()
 
 		case key.Matches(msg, keyMap.ToggleGitPane):
 			m.showGitPane = !m.showGitPane
+			m.saveUIPrefs()
 
 		case key.Matches(msg, keyMap.Search):
 			if m.focus != focusSplit {
@@ -2937,7 +2940,7 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.offset2 = 0
 			m.reloadSplit()
 		}
-		saveUIPrefs(m.showDetails, m.showHidden)
+		m.saveUIPrefs()
 
 	case key.Matches(msg, keyMap.ToggleFavorite):
 		if len(visible) > 0 {
@@ -3080,7 +3083,7 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.offset2 = 0
 		m.reloadMainQuiet()
 		m.reloadSplit()
-		saveUIPrefs(m.showDetails, m.showHidden)
+		m.saveUIPrefs()
 
 	case key.Matches(msg, keyMap.ToggleFavorite):
 		if len(m.entries2) > 0 {

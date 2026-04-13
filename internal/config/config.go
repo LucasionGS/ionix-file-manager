@@ -36,6 +36,7 @@ type Macro struct {
 type Config struct {
 	ShowDetails bool     `json:"show_details"`
 	ShowHidden  bool     `json:"show_hidden"`
+	ShowGitPane bool     `json:"show_git_pane"`
 	Colors      Colors   `json:"colors,omitempty"`
 	Favorites   []string `json:"favorites,omitempty"`
 }
