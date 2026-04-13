@@ -43,6 +43,13 @@ var (
 	StyleDetailsLabel          lipgloss.Style
 	StyleDetailsValue          lipgloss.Style
 	StyleDetailsValueDir       lipgloss.Style
+	StyleGitModified           lipgloss.Style
+	StyleGitStaged             lipgloss.Style
+	StyleGitUntracked          lipgloss.Style
+	StyleGitAdded              lipgloss.Style
+	StyleGitDeleted            lipgloss.Style
+	StyleGitConflict           lipgloss.Style
+	StyleGitRenamed            lipgloss.Style
 )
 
 func init() {
@@ -146,4 +153,12 @@ func ApplyColors(c appconfig.Colors) {
 	StyleDetailsValueDir = lipgloss.NewStyle().
 		Foreground(colorDir).
 		Bold(true)
+
+	StyleGitModified = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#b45309", Dark: "#fbbf24"})
+	StyleGitStaged = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#15803d", Dark: "#4ade80"})
+	StyleGitUntracked = lipgloss.NewStyle().Foreground(colorDim)
+	StyleGitAdded = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#15803d", Dark: "#4ade80"})
+	StyleGitDeleted = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#b91c1c", Dark: "#f87171"})
+	StyleGitConflict = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#b91c1c", Dark: "#f87171"}).Bold(true)
+	StyleGitRenamed = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1d4ed8", Dark: "#60a5fa"})
 }

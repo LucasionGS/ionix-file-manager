@@ -20,6 +20,7 @@ import (
 	"github.com/LucasionGS/ionix-file-manager/internal/clipboard"
 	appconfig "github.com/LucasionGS/ionix-file-manager/internal/config"
 	appfs "github.com/LucasionGS/ionix-file-manager/internal/fs"
+	appgit "github.com/LucasionGS/ionix-file-manager/internal/git"
 	"github.com/LucasionGS/ionix-file-manager/internal/kitty"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -370,12 +371,12 @@ var allPaletteCommands = []paletteCmd{
 				m.cwd2 = home
 				m.cursor2 = 0
 				m.offset2 = 0
-				m.entries2, _ = m.loadEntries2()
+				m.reloadSplit()
 			} else {
 				m.cwd = home
 				m.cursor = 0
 				m.offset = 0
-				m.entries, m.err = m.loadEntries()
+				m.reloadMain()
 			}
 		}
 		return m, m.maybeLoadPreview()
@@ -456,9 +457,9 @@ var allPaletteCommands = []paletteCmd{
 				m.statusMsg = fmt.Sprintf("pasted  %d items", pasteCount)
 			}
 			if m.focus == focusSplit {
-				m.entries2, _ = m.loadEntries2()
+				m.reloadSplit()
 			} else {
-				m.entries, _ = m.loadEntries()
+				m.reloadMainQuiet()
 			}
 		}
 		return m, m.maybeLoadPreview()
@@ -523,7 +524,7 @@ var allPaletteCommands = []paletteCmd{
 			m.cwd2 = m.cwd
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 			m.focus = focusSplit
 		}
 		return m, nil
@@ -541,11 +542,11 @@ var allPaletteCommands = []paletteCmd{
 		m.showHidden = !m.showHidden
 		m.cursor = 0
 		m.offset = 0
-		m.entries, m.err = m.loadEntries()
+		m.reloadMain()
 		if m.showSplit {
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 		}
 		saveUIPrefs(m.showDetails, m.showHidden)
 		return m, m.maybeLoadPreview()
@@ -1270,6 +1271,7 @@ var keyMap = struct {
 	Rename                key.Binding
 	Palette               key.Binding
 	RunMacro              key.Binding
+	ToggleGitPane         key.Binding
 }{
 	Up:              key.NewBinding(key.WithKeys("up", "k")),
 	Down:            key.NewBinding(key.WithKeys("down", "j")),
@@ -1296,6 +1298,7 @@ var keyMap = struct {
 	Rename:          key.NewBinding(key.WithKeys("f2")),
 	Palette:         key.NewBinding(key.WithKeys("f1")),
 	RunMacro:        key.NewBinding(key.WithKeys(",")),
+	ToggleGitPane:   key.NewBinding(key.WithKeys("G")),
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1353,12 @@ type Model struct {
 	lastSelectedPath  string
 	selected2Paths    map[string]bool
 	lastSelected2Path string
+
+	showGitPane bool
+	gitRoot     string                       // cached repo root for main pane
+	gitStatus   map[string]appgit.FileStatus // entry name → status for main pane CWD
+	gitRoot2    string                       // cached repo root for split pane
+	gitStatus2  map[string]appgit.FileStatus // entry name → status for split pane CWD
 }
 
 func buildBookmarks() []bookmark {
@@ -1429,6 +1438,7 @@ func New(startDir, selectName string) Model {
 		favorites:    cfg.Favorites,
 	}
 	m.entries, m.err = m.loadEntries()
+	m.refreshGitStatus()
 	if selectName != "" {
 		for i, e := range m.entries {
 			if e.Name == selectName {
@@ -1464,7 +1474,7 @@ func (m Model) loadEntries() ([]appfs.Entry, error) {
 // fileListWidth returns the column width allocated to each file list pane.
 func (m Model) fileListWidth() int {
 	w := m.width - sidebarWidth
-	if m.showDetails {
+	if m.showDetails || m.showGitPane {
 		w -= detailsWidth
 	}
 	if m.showSplit {
@@ -1565,6 +1575,38 @@ func (m Model) loadEntries2() ([]appfs.Entry, error) {
 		}
 	}
 	return filtered, nil
+}
+
+// refreshGitStatus updates the cached git repo root and file statuses for the
+// main pane. It reuses the cached root when navigating deeper into the same repo.
+func (m *Model) refreshGitStatus() {
+	m.gitRoot = appgit.DetectRepo(m.cwd, m.gitRoot)
+	m.gitStatus = appgit.Status(m.cwd, m.gitRoot)
+}
+
+// refreshGitStatus2 updates the cached git repo root and file statuses for the
+// split pane.
+func (m *Model) refreshGitStatus2() {
+	m.gitRoot2 = appgit.DetectRepo(m.cwd2, m.gitRoot2)
+	m.gitStatus2 = appgit.Status(m.cwd2, m.gitRoot2)
+}
+
+// reloadMain loads entries for the main pane and refreshes its git status.
+func (m *Model) reloadMain() {
+	m.entries, m.err = m.loadEntries()
+	m.refreshGitStatus()
+}
+
+// reloadMainQuiet loads entries for the main pane (ignoring errors) and refreshes git status.
+func (m *Model) reloadMainQuiet() {
+	m.entries, _ = m.loadEntries()
+	m.refreshGitStatus()
+}
+
+// reloadSplit loads entries for the split pane and refreshes its git status.
+func (m *Model) reloadSplit() {
+	m.entries2, _ = m.loadEntries2()
+	m.refreshGitStatus2()
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,14 +1713,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("editor error: %v", msg.err)
 		}
-		m.entries, _ = m.loadEntries()
+		m.reloadMainQuiet()
 		return m, m.maybeLoadPreview()
 
 	case macroClosedMsg:
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("macro error: %v", msg.err)
 		}
-		m.entries, _ = m.loadEntries()
+		m.reloadMainQuiet()
 		return m, m.maybeLoadPreview()
 
 	case tea.KeyMsg:
@@ -1855,9 +1897,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = fmt.Sprintf("pasted  %d items", pasteCount)
 				}
 				if m.focus == focusSplit {
-					m.entries2, _ = m.loadEntries2()
+					m.reloadSplit()
 				} else {
-					m.entries, _ = m.loadEntries()
+					m.reloadMainQuiet()
 				}
 			}
 
@@ -1868,6 +1910,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.previewEncoded = ""
 			}
 			saveUIPrefs(m.showDetails, m.showHidden)
+
+		case key.Matches(msg, keyMap.ToggleGitPane):
+			m.showGitPane = !m.showGitPane
 
 		case key.Matches(msg, keyMap.Search):
 			if m.focus != focusSplit {
@@ -1969,7 +2014,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cwd2 = m.cwd
 				m.cursor2 = 0
 				m.offset2 = 0
-				m.entries2, _ = m.loadEntries2()
+				m.reloadSplit()
 				m.focus = focusSplit
 			}
 
@@ -2111,9 +2156,9 @@ func (m Model) execMenuAction(item menuEntry) Model {
 				m.statusMsg = fmt.Sprintf("pasted  %d items", pasteCount)
 			}
 			if m.focus == focusSplit {
-				m.entries2, _ = m.loadEntries2()
+				m.reloadSplit()
 			} else {
-				m.entries, _ = m.loadEntries()
+				m.reloadMainQuiet()
 			}
 		}
 
@@ -2154,9 +2199,9 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			} else {
 				m.statusMsg = fmt.Sprintf("extracted  %s", e.Name)
 				if m.focus == focusSplit {
-					m.entries2, _ = m.loadEntries2()
+					m.reloadSplit()
 				} else {
-					m.entries, _ = m.loadEntries()
+					m.reloadMainQuiet()
 				}
 			}
 		}
@@ -2195,7 +2240,7 @@ func (m Model) updateSidebar(msg tea.KeyMsg) Model {
 			m.cwd = targetPath
 			m.cursor = 0
 			m.offset = 0
-			m.entries, m.err = m.loadEntries()
+			m.reloadMain()
 			m.focus = focusList
 		}
 	}
@@ -2231,12 +2276,12 @@ func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 		} else {
 			m.statusMsg = fmt.Sprintf("deleted  %d items", deleted)
 		}
-		m.entries, _ = m.loadEntries()
+		m.reloadMainQuiet()
 		if m.cursor >= len(m.entries) && m.cursor > 0 {
 			m.cursor = len(m.entries) - 1
 		}
 		if m.showSplit {
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 			if m.cursor2 >= len(m.entries2) && m.cursor2 > 0 {
 				m.cursor2 = len(m.entries2) - 1
 			}
@@ -2266,7 +2311,7 @@ func (m Model) updateRenameModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 		} else {
 			m.statusMsg = fmt.Sprintf("renamed  %s", newName)
 			if m.focus == focusSplit {
-				m.entries2, _ = m.loadEntries2()
+				m.reloadSplit()
 				for i, e := range m.entries2 {
 					if e.Path == newPath {
 						m.cursor2 = i
@@ -2274,7 +2319,7 @@ func (m Model) updateRenameModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 					}
 				}
 			} else {
-				m.entries, _ = m.loadEntries()
+				m.reloadMainQuiet()
 				for i, e := range m.entries {
 					if e.Path == newPath {
 						m.cursor = i
@@ -2363,12 +2408,12 @@ func (m Model) updateNewItemModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("error: %v", lastErr)
 		} else {
 			if m.focus == focusSplit {
-				m.entries2, _ = m.loadEntries2()
+				m.reloadSplit()
 				if m.cursor2 < 0 || m.cursor2 >= len(m.entries2) {
 					m.cursor2 = 0
 				}
 			} else {
-				m.entries, m.err = m.loadEntries()
+				m.reloadMain()
 				if m.cursor < 0 || m.cursor >= len(m.entries) {
 					m.cursor = 0
 				}
@@ -2654,12 +2699,12 @@ func (m Model) updateGoToModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd2 = target
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 		} else {
 			m.cwd = target
 			m.cursor = 0
 			m.offset = 0
-			m.entries, m.err = m.loadEntries()
+			m.reloadMain()
 		}
 		return m, m.maybeLoadPreview()
 
@@ -2731,12 +2776,12 @@ func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd = entry.Path
 			m.cursor = 0
 			m.offset = 0
-			m.entries, m.err = m.loadEntries()
+			m.reloadMain()
 			if m.err != nil {
 				m.statusMsg = fmt.Sprintf("error: %v", m.err)
 				m.err = nil
 				m.cwd = filepath.Dir(m.cwd)
-				m.entries, _ = m.loadEntries()
+				m.reloadMainQuiet()
 			}
 		} else if appfs.IsImage(entry.Name) {
 			if !kitty.IsSupported() {
@@ -2826,7 +2871,7 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.search = searchModel{}
 			m.previewPath = ""
 			m.previewEncoded = ""
-			m.entries, m.err = m.loadEntries()
+			m.reloadMain()
 			// Re-select the folder we just came out of.
 			prevName := filepath.Base(prevDir)
 			listH := m.listHeight()
@@ -2850,12 +2895,12 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd = entry.Path
 			m.cursor = 0
 			m.offset = 0
-			m.entries, m.err = m.loadEntries()
+			m.reloadMain()
 			if m.err != nil {
 				m.statusMsg = fmt.Sprintf("error: %v", m.err)
 				m.err = nil
 				m.cwd = filepath.Dir(m.cwd)
-				m.entries, _ = m.loadEntries()
+				m.reloadMainQuiet()
 			}
 		} else if appfs.IsImage(entry.Name) {
 			if !kitty.IsSupported() {
@@ -2879,18 +2924,18 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd = home
 			m.cursor = 0
 			m.offset = 0
-			m.entries, m.err = m.loadEntries()
+			m.reloadMain()
 		}
 
 	case key.Matches(msg, keyMap.ToggleHidden):
 		m.showHidden = !m.showHidden
 		m.cursor = 0
 		m.offset = 0
-		m.entries, m.err = m.loadEntries()
+		m.reloadMain()
 		if m.showSplit {
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 		}
 		saveUIPrefs(m.showDetails, m.showHidden)
 
@@ -2979,7 +3024,7 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd2 = parent
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 			prevName := filepath.Base(prevDir)
 			for i, e := range m.entries2 {
 				if e.Name == prevName {
@@ -3001,7 +3046,7 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd2 = entry.Path
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 		} else if appfs.IsImage(entry.Name) {
 			if !kitty.IsSupported() {
 				m.statusMsg = "image preview requires kitty terminal"
@@ -3024,7 +3069,7 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cwd2 = home
 			m.cursor2 = 0
 			m.offset2 = 0
-			m.entries2, _ = m.loadEntries2()
+			m.reloadSplit()
 		}
 
 	case key.Matches(msg, keyMap.ToggleHidden):
@@ -3033,8 +3078,8 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.offset = 0
 		m.cursor2 = 0
 		m.offset2 = 0
-		m.entries, _ = m.loadEntries()
-		m.entries2, _ = m.loadEntries2()
+		m.reloadMainQuiet()
+		m.reloadSplit()
 		saveUIPrefs(m.showDetails, m.showHidden)
 
 	case key.Matches(msg, keyMap.ToggleFavorite):
@@ -3315,10 +3360,30 @@ func (m Model) renderNormal() string {
 
 	cols := []string{m.renderSidebar(listH), m.renderFileList(listH, listW)}
 	if m.showSplit {
-		cols = append(cols, m.renderFilePaneAt(listH, listW, m.entries2, m.cursor2, m.offset2, m.focus == focusSplit, m.selected2Paths))
+		cols = append(cols, m.renderFilePaneAt(listH, listW, m.entries2, m.cursor2, m.offset2, m.focus == focusSplit, m.selected2Paths, m.gitStatus2))
 	}
-	if m.showDetails {
+	if m.showDetails && m.showGitPane {
+		// Each pane adds 2 lines of border overhead (top + bottom).
+		// Total inner content = listH - 2 border lines.
+		available := listH - 2
+		gitH := available / 3
+		if gitH < 6 {
+			gitH = 6
+		}
+		detailH := available - gitH
+		if detailH < 6 {
+			detailH = 6
+			gitH = available - detailH
+		}
+		rightCol := lipgloss.JoinVertical(lipgloss.Left,
+			m.renderDetails(detailH),
+			m.renderGitPane(gitH),
+		)
+		cols = append(cols, rightCol)
+	} else if m.showDetails {
 		cols = append(cols, m.renderDetails(listH))
+	} else if m.showGitPane {
+		cols = append(cols, m.renderGitPane(listH))
 	}
 	body := lipgloss.JoinHorizontal(lipgloss.Top, cols...)
 
@@ -3459,6 +3524,8 @@ func (m Model) renderSidebar(height int) string {
 			}
 			rows = append(rows, style.Width(innerW).Render(label))
 		}
+
+		height--
 	}
 
 	for len(rows) < height {
@@ -3473,7 +3540,7 @@ func (m Model) renderSidebar(height int) string {
 	return paneStyle.Width(sidebarWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
 }
 
-func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor, offset int, isActive bool, selectedPaths map[string]bool) string {
+func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor, offset int, isActive bool, selectedPaths map[string]bool, gitStatus map[string]appgit.FileStatus) string {
 	innerW := width - 4
 
 	var rows []string
@@ -3482,6 +3549,12 @@ func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor
 		name := e.Name
 		if e.IsDir {
 			name += "/"
+		}
+
+		// Git status indicator.
+		var gitPrefix string
+		if gs, ok := gitStatus[e.Name]; ok && gs != appgit.StatusNone {
+			gitPrefix = gs.Label() + " "
 		}
 
 		var style lipgloss.Style
@@ -3498,9 +3571,33 @@ func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor
 			style = StyleNormal
 		}
 
+		displayName := gitPrefix + name
+
 		var rendered string
 		if i == cursor {
-			rendered = style.Width(innerW).Render(name)
+			rendered = style.Width(innerW).Render(displayName)
+		} else if gitPrefix != "" {
+			gs := gitStatus[e.Name]
+			var gsStyle lipgloss.Style
+			switch gs {
+			case appgit.StatusModified:
+				gsStyle = StyleGitModified
+			case appgit.StatusStaged:
+				gsStyle = StyleGitStaged
+			case appgit.StatusUntracked:
+				gsStyle = StyleGitUntracked
+			case appgit.StatusAdded:
+				gsStyle = StyleGitAdded
+			case appgit.StatusDeleted:
+				gsStyle = StyleGitDeleted
+			case appgit.StatusConflict:
+				gsStyle = StyleGitConflict
+			case appgit.StatusRenamed:
+				gsStyle = StyleGitRenamed
+			default:
+				gsStyle = StyleDim
+			}
+			rendered = gsStyle.Render(gitPrefix) + style.MaxWidth(innerW-2).Render(name)
 		} else {
 			rendered = style.MaxWidth(innerW).Render(name)
 		}
@@ -3519,7 +3616,7 @@ func (m Model) renderFilePaneAt(height, width int, entries []appfs.Entry, cursor
 }
 
 func (m Model) renderFileList(height, width int) string {
-	return m.renderFilePaneAt(height, width, m.visibleEntries(), m.cursor, m.offset, m.focus == focusList, m.selectedPaths)
+	return m.renderFilePaneAt(height, width, m.visibleEntries(), m.cursor, m.offset, m.focus == focusList, m.selectedPaths, m.gitStatus)
 }
 
 // calcPreviewSize returns the cell (cols, rows) that preserve the image's
@@ -3651,6 +3748,60 @@ func (m Model) renderDetails(height int) string {
 	return StylePane.Width(detailsWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
 }
 
+func (m Model) renderGitPane(height int) string {
+	innerW := detailsWidth - 4
+	var rows []string
+
+	label := func(s string) string {
+		return StyleDetailsLabel.Render(s)
+	}
+	val := func(s string) string {
+		return StyleDetailsValue.MaxWidth(innerW).Render(s)
+	}
+
+	gitRoot := m.gitRoot
+	gitStatus := m.gitStatus
+	if m.focus == focusSplit {
+		gitRoot = m.gitRoot2
+		gitStatus = m.gitStatus2
+	}
+
+	if gitRoot == "" {
+		rows = append(rows, StyleDim.Render("not a git repo"))
+	} else {
+		rows = append(rows, label("BRANCH"))
+		branch := appgit.Branch(gitRoot)
+		if branch == "" {
+			branch = "(detached)"
+		}
+		rows = append(rows, val(" "+branch))
+		rows = append(rows, "")
+
+		// Status of selected entry
+		visible := m.activeVisible()
+		cursor := m.activeCursor()
+		if len(visible) > 0 && cursor >= 0 && cursor < len(visible) {
+			e := visible[cursor]
+			rows = append(rows, label("STATUS"))
+			if gs, ok := gitStatus[e.Name]; ok && gs != appgit.StatusNone {
+				rows = append(rows, val(gitStatusLabel(gs)))
+			} else {
+				rows = append(rows, val("clean"))
+			}
+			rows = append(rows, "")
+		}
+
+		rows = append(rows, label("ROOT"))
+		rows = append(rows, val(gitRoot))
+	}
+
+	for len(rows) < height {
+		rows = append(rows, "")
+	}
+
+	return StylePane.Width(detailsWidth - 2).Height(height).Render(strings.Join(rows, "\n"))
+}
+
 func formatSize(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -3662,6 +3813,29 @@ func formatSize(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func gitStatusLabel(s appgit.FileStatus) string {
+	switch s {
+	case appgit.StatusModified:
+		return "modified"
+	case appgit.StatusStaged:
+		return "staged"
+	case appgit.StatusUntracked:
+		return "untracked"
+	case appgit.StatusAdded:
+		return "added"
+	case appgit.StatusDeleted:
+		return "deleted"
+	case appgit.StatusRenamed:
+		return "renamed"
+	case appgit.StatusConflict:
+		return "conflict"
+	case appgit.StatusIgnored:
+		return "ignored"
+	default:
+		return "clean"
+	}
 }
 
 func (m Model) renderSearchBar() string {
