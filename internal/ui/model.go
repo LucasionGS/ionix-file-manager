@@ -12,9 +12,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LucasionGS/ionix-file-manager/internal/clipboard"
@@ -91,6 +94,7 @@ const (
 	menuFavoriteToggle
 	menuExtract
 	menuRename
+	menuPermissions
 	menuCancel
 )
 
@@ -220,6 +224,10 @@ func (m *Model) buildMenu() []menuEntry {
 		items = append(items, menuEntry{icon: "󰐅", label: "Rename", action: menuRename})
 	}
 
+	if hasSelection {
+		items = append(items, menuEntry{icon: "󰌋", label: "Permissions", action: menuPermissions})
+	}
+
 	items = append(items, menuEntry{icon: "󰜺", label: "Cancel", action: menuCancel})
 	return items
 }
@@ -238,6 +246,74 @@ type renameModal struct {
 	target appfs.Entry
 	query  string
 	err    string
+}
+
+// ---------------------------------------------------------------------------
+// Permissions modal
+// ---------------------------------------------------------------------------
+
+type permissionsModal struct {
+	open      bool
+	target    appfs.Entry
+	cursor    int     // 0=user, 1=group, 2=other, 3=recursive (dirs only)
+	perms     [9]bool // [0-2]=user rwx, [3-5]=group rwx, [6-8]=other rwx
+	owner     string  // display
+	group     string  // display
+	recursive bool
+	err       string
+}
+
+func (pm permissionsModal) permString(row int) string {
+	base := row * 3
+	var b [3]byte
+	if pm.perms[base+0] {
+		b[0] = 'R'
+	} else {
+		b[0] = '-'
+	}
+	if pm.perms[base+1] {
+		b[1] = 'W'
+	} else {
+		b[1] = '-'
+	}
+	if pm.perms[base+2] {
+		b[2] = 'X'
+	} else {
+		b[2] = '-'
+	}
+	return string(b[:])
+}
+
+func (pm permissionsModal) fileMode() os.FileMode {
+	var mode os.FileMode
+	if pm.perms[0] {
+		mode |= 0400
+	}
+	if pm.perms[1] {
+		mode |= 0200
+	}
+	if pm.perms[2] {
+		mode |= 0100
+	}
+	if pm.perms[3] {
+		mode |= 0040
+	}
+	if pm.perms[4] {
+		mode |= 0020
+	}
+	if pm.perms[5] {
+		mode |= 0010
+	}
+	if pm.perms[6] {
+		mode |= 0004
+	}
+	if pm.perms[7] {
+		mode |= 0002
+	}
+	if pm.perms[8] {
+		mode |= 0001
+	}
+	return mode
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1407,7 @@ type Model struct {
 	imageModal       imageModalState
 	audioPlayer      audioModal
 	renameModal      renameModal
+	permModal        permissionsModal
 	search           searchModel
 	macroRunner      macroModal
 	macroManager     macroManagerModal
@@ -1802,6 +1879,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// Permissions modal captures all input while open.
+		if m.permModal.open {
+			var cmd tea.Cmd
+			m, cmd = m.updatePermissionsModal(msg)
+			return m, cmd
+		}
+
 		// Command palette captures all input while open.
 		if m.palette.open {
 			var cmd tea.Cmd
@@ -2214,6 +2298,34 @@ func (m Model) execMenuAction(item menuEntry) Model {
 		m.renameModal = renameModal{open: true, target: e, query: e.Name}
 		m.statusMsg = ""
 
+	case menuPermissions:
+		e := active[cursor]
+		info, err := os.Lstat(e.Path)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("stat error: %v", err)
+			break
+		}
+		mode := info.Mode().Perm()
+		pm := permissionsModal{
+			open:   true,
+			target: e,
+			perms: [9]bool{
+				mode&0400 != 0, mode&0200 != 0, mode&0100 != 0,
+				mode&0040 != 0, mode&0020 != 0, mode&0010 != 0,
+				mode&0004 != 0, mode&0002 != 0, mode&0001 != 0,
+			},
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			if u, err := user.LookupId(strconv.Itoa(int(stat.Uid))); err == nil {
+				pm.owner = u.Username
+			}
+			if g, err := user.LookupGroupId(strconv.Itoa(int(stat.Gid))); err == nil {
+				pm.group = g.Name
+			}
+		}
+		m.permModal = pm
+		m.statusMsg = ""
+
 	case menuCancel:
 		// nothing
 	}
@@ -2362,6 +2474,144 @@ func (m Model) renderRenameModal() string {
 		lines = append(lines, StyleSelected.Render("  "+m.renameModal.err))
 	}
 	lines = append(lines, hint, "")
+	box := StylePaneActive.Width(modalW).Render(strings.Join(lines, "\n"))
+	return m.overlayModal(box)
+}
+
+func (m Model) updatePermissionsModal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		newMode := m.permModal.fileMode()
+		target := m.permModal.target.Path
+		recursive := m.permModal.recursive && m.permModal.target.IsDir
+		m.permModal = permissionsModal{}
+		var chmodErr error
+		if recursive {
+			chmodErr = filepath.Walk(target, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				return os.Chmod(path, newMode)
+			})
+		} else {
+			chmodErr = os.Chmod(target, newMode)
+		}
+		if chmodErr != nil {
+			m.statusMsg = fmt.Sprintf("chmod error: %v", chmodErr)
+		} else {
+			suffix := ""
+			if recursive {
+				suffix = " (recursive)"
+			}
+			m.statusMsg = fmt.Sprintf("permissions set  %s  %04o%s", filepath.Base(target), newMode, suffix)
+			if m.focus == focusSplit {
+				m.reloadSplit()
+			} else {
+				m.reloadMainQuiet()
+			}
+		}
+		return m, m.maybeLoadPreview()
+
+	case tea.KeyEsc:
+		m.permModal = permissionsModal{}
+
+	case tea.KeyUp:
+		if m.permModal.cursor > 0 {
+			m.permModal.cursor--
+		}
+
+	case tea.KeyDown:
+		max := 2
+		if m.permModal.target.IsDir {
+			max = 3
+		}
+		if m.permModal.cursor < max {
+			m.permModal.cursor++
+		}
+
+	case tea.KeyRunes:
+		if m.permModal.cursor == 3 {
+			// recursive row — toggle with any key
+			m.permModal.recursive = !m.permModal.recursive
+		} else {
+			row := m.permModal.cursor
+			base := row * 3
+			for _, r := range msg.Runes {
+				switch r {
+				case 'r', 'R':
+					m.permModal.perms[base+0] = !m.permModal.perms[base+0]
+				case 'w', 'W':
+					m.permModal.perms[base+1] = !m.permModal.perms[base+1]
+				case 'x', 'X':
+					m.permModal.perms[base+2] = !m.permModal.perms[base+2]
+				}
+			}
+		}
+
+	case tea.KeySpace:
+		if m.permModal.cursor == 3 {
+			m.permModal.recursive = !m.permModal.recursive
+		}
+	}
+	return m, nil
+}
+
+func (m Model) renderPermissionsModal() string {
+	const modalW = 48
+	pm := m.permModal
+
+	title := StyleDim.Render("Permissions  " + pm.target.Name)
+
+	rows := [3]struct{ label, extra string }{
+		{"User", pm.owner},
+		{"Group", pm.group},
+		{"Other", ""},
+	}
+
+	var lines []string
+	lines = append(lines, "", title, "")
+
+	for i, row := range rows {
+		label := fmt.Sprintf("  %-6s", row.label)
+		if row.extra != "" {
+			label += StyleDim.Render(" (" + row.extra + ")")
+		}
+		permStr := pm.permString(i)
+		if i == pm.cursor {
+			label = StyleSelected.Render(label)
+			permStr = StyleCursor.Render(" " + permStr + " ")
+		} else {
+			label = StyleNormal.Render(label)
+			permStr = StyleDim.Render(" " + permStr + " ")
+		}
+		lines = append(lines, label+"  "+permStr)
+	}
+
+	if pm.target.IsDir {
+		recLabel := "  Recursive"
+		var recVal string
+		if pm.recursive {
+			recVal = "[X]"
+		} else {
+			recVal = "[ ]"
+		}
+		if pm.cursor == 3 {
+			recLabel = StyleSelected.Render(recLabel)
+			recVal = StyleCursor.Render(" " + recVal + " ")
+		} else {
+			recLabel = StyleNormal.Render(recLabel)
+			recVal = StyleDim.Render(" " + recVal + " ")
+		}
+		lines = append(lines, "", recLabel+"  "+recVal)
+	}
+
+	octal := fmt.Sprintf("%04o", pm.fileMode())
+	lines = append(lines, "", StyleDim.Render("  Octal: "+octal))
+	if pm.err != "" {
+		lines = append(lines, StyleSelected.Render("  "+pm.err))
+	}
+	lines = append(lines, "", StyleDim.Render("r/w/x  toggle   enter  apply   esc  cancel"), "")
+
 	box := StylePaneActive.Width(modalW).Render(strings.Join(lines, "\n"))
 	return m.overlayModal(box)
 }
@@ -3179,6 +3429,10 @@ func (m Model) View() string {
 
 	if m.renameModal.open {
 		return m.renderRenameModal()
+	}
+
+	if m.permModal.open {
+		return m.renderPermissionsModal()
 	}
 
 	if m.palette.open {
