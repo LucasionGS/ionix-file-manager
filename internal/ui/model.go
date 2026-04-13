@@ -3624,7 +3624,12 @@ func (m Model) renderNormal() string {
 		// Total inner content = listH - 2 border lines.
 		available := listH - 2
 		gitH := available / 3
-		if gitH < 6 {
+
+		if (m.gitRoot == "" && m.focus != focusSplit) || (m.gitRoot2 == "" && m.focus == focusSplit) {
+			// still show the pane with a message about no git repo
+			// so user isn't confused where git status went
+			gitH = 1
+		} else if gitH < 6 {
 			gitH = 6
 		}
 		detailH := available - gitH
