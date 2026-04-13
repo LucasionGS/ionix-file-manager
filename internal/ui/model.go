@@ -3114,6 +3114,39 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 		}
 
+	case msg.Type == tea.KeyHome:
+		m.cursor = 0
+		m.offset = 0
+
+	case msg.Type == tea.KeyEnd:
+		if len(visible) > 0 {
+			m.cursor = len(visible) - 1
+			if m.cursor >= listH {
+				m.offset = m.cursor - listH + 1
+			}
+		}
+
+	case msg.Type == tea.KeyPgUp:
+		m.cursor -= 5
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		if m.cursor < m.offset {
+			m.offset = m.cursor
+		}
+
+	case msg.Type == tea.KeyPgDown:
+		m.cursor += 5
+		if m.cursor >= len(visible) {
+			m.cursor = len(visible) - 1
+		}
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		if m.cursor >= m.offset+listH {
+			m.offset = m.cursor - listH + 1
+		}
+
 	case key.Matches(msg, keyMap.Left):
 		parent := filepath.Dir(m.cwd)
 		if parent != m.cwd {
@@ -3268,6 +3301,39 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 			if m.cursor2 >= m.offset2+listH {
 				m.offset2 = m.cursor2 - listH + 1
 			}
+		}
+
+	case msg.Type == tea.KeyHome:
+		m.cursor2 = 0
+		m.offset2 = 0
+
+	case msg.Type == tea.KeyEnd:
+		if len(m.entries2) > 0 {
+			m.cursor2 = len(m.entries2) - 1
+			if m.cursor2 >= listH {
+				m.offset2 = m.cursor2 - listH + 1
+			}
+		}
+
+	case msg.Type == tea.KeyPgUp:
+		m.cursor2 -= 5
+		if m.cursor2 < 0 {
+			m.cursor2 = 0
+		}
+		if m.cursor2 < m.offset2 {
+			m.offset2 = m.cursor2
+		}
+
+	case msg.Type == tea.KeyPgDown:
+		m.cursor2 += 5
+		if m.cursor2 >= len(m.entries2) {
+			m.cursor2 = len(m.entries2) - 1
+		}
+		if m.cursor2 < 0 {
+			m.cursor2 = 0
+		}
+		if m.cursor2 >= m.offset2+listH {
+			m.offset2 = m.cursor2 - listH + 1
 		}
 
 	case key.Matches(msg, keyMap.Left):
