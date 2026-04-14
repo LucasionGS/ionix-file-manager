@@ -37,7 +37,7 @@ func Encode(data []byte) string {
 // id identifies the image for later deletion. f=100 lets kitty detect the
 // format automatically (PNG, JPEG, etc.).
 func Place(encoded string, col, row, cols, rows, id int) string {
-	opts := fmt.Sprintf("a=T,f=100,c=%d,r=%d,i=%d", cols, rows, id)
+	opts := fmt.Sprintf("a=T,f=100,c=%d,r=%d,i=%d,q=2", cols, rows, id)
 
 	var sb strings.Builder
 	sb.WriteString("\033[s") // save cursor
