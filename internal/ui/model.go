@@ -431,15 +431,16 @@ type newItemModal struct {
 type sftpConnectModal struct {
 	open   bool
 	cursor int
-	scroll int // scroll offset for host list viewport
+	scroll int               // scroll offset for host list viewport
 	hosts  []appsftp.SSHHost // parsed from SSH config
+	search string            // live filter query
 	// Manual entry fields
-	manual     bool
-	field      int    // 0=user, 1=host, 2=port
-	userQuery  string
-	hostQuery  string
-	portQuery  string
-	err        string
+	manual    bool
+	field     int // 0=user, 1=host, 2=port
+	userQuery string
+	hostQuery string
+	portQuery string
+	err       string
 }
 
 // sftpConnectedMsg is sent when an SFTP connection succeeds.
@@ -1525,9 +1526,9 @@ type Model struct {
 	gitStatus2  map[string]appgit.FileStatus // entry name → status for split pane CWD
 
 	// SFTP
-	sftpModal   sftpConnectModal       // connection picker modal
-	sftpClient  *appsftp.Client        // active SFTP connection for main pane (nil = local)
-	sftpClient2 *appsftp.Client        // active SFTP connection for split pane (nil = local)
+	sftpModal   sftpConnectModal // connection picker modal
+	sftpClient  *appsftp.Client  // active SFTP connection for main pane (nil = local)
+	sftpClient2 *appsftp.Client  // active SFTP connection for split pane (nil = local)
 }
 
 func buildBookmarks() []bookmark {
@@ -5222,38 +5223,64 @@ func (m Model) updateSFTPModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.updateSFTPManualEntry(msg)
 	}
 
-	totalItems := len(m.sftpModal.hosts) + 1 // +1 for "Connect to SFTP..." at top
+	filtered := m.sftpFilteredHosts()
+	totalItems := len(filtered) + 1 // +1 for "Connect to SFTP..." at top
+
+	clampCursor := func() {
+		if m.sftpModal.cursor >= totalItems {
+			m.sftpModal.cursor = totalItems - 1
+		}
+		if m.sftpModal.cursor < 0 {
+			m.sftpModal.cursor = 0
+		}
+		visible := m.sftpModalVisibleRows()
+		if m.sftpModal.cursor < m.sftpModal.scroll {
+			m.sftpModal.scroll = m.sftpModal.cursor
+		}
+		if m.sftpModal.cursor >= m.sftpModal.scroll+visible {
+			m.sftpModal.scroll = m.sftpModal.cursor - visible + 1
+		}
+	}
 
 	switch {
 	case msg.Type == tea.KeyEsc:
-		m.sftpModal = sftpConnectModal{}
+		if m.sftpModal.search != "" {
+			// Clear search first, don't close modal.
+			m.sftpModal.search = ""
+			m.sftpModal.cursor = 0
+			m.sftpModal.scroll = 0
+		} else {
+			m.sftpModal = sftpConnectModal{}
+		}
 
-	case key.Matches(msg, keyMap.Up):
+	case msg.Type == tea.KeyBackspace:
+		if r := []rune(m.sftpModal.search); len(r) > 0 {
+			m.sftpModal.search = string(r[:len(r)-1])
+			m.sftpModal.cursor = 0
+			m.sftpModal.scroll = 0
+		}
+
+	case msg.Type == tea.KeyUp:
 		if m.sftpModal.cursor > 0 {
 			m.sftpModal.cursor--
-			if m.sftpModal.cursor < m.sftpModal.scroll {
-				m.sftpModal.scroll = m.sftpModal.cursor
-			}
+			clampCursor()
 		}
 
-	case key.Matches(msg, keyMap.Down):
+	case msg.Type == tea.KeyDown:
 		if m.sftpModal.cursor < totalItems-1 {
 			m.sftpModal.cursor++
-			visible := m.sftpModalVisibleRows()
-			if m.sftpModal.cursor >= m.sftpModal.scroll+visible {
-				m.sftpModal.scroll = m.sftpModal.cursor - visible + 1
-			}
+			clampCursor()
 		}
 
-	case key.Matches(msg, keyMap.Right), msg.Type == tea.KeyEnter:
+	case msg.Type == tea.KeyRight, msg.Type == tea.KeyEnter:
 		if m.sftpModal.cursor == 0 {
 			// Manual entry mode.
 			m.sftpModal.manual = true
 			m.sftpModal.field = 0
 			m.sftpModal.err = ""
 		} else {
-			// Connect to selected SSH host.
-			host := m.sftpModal.hosts[m.sftpModal.cursor-1]
+			// Connect to selected SSH host (from filtered list).
+			host := filtered[m.sftpModal.cursor-1]
 			u := host.User
 			if u == "" {
 				cu, _ := user.Current()
@@ -5264,6 +5291,13 @@ func (m Model) updateSFTPModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 				}
 			}
 			return m, connectSFTPCmd(u, host.HostName, host.Port, host.IdentityFile)
+		}
+
+	default:
+		if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+			m.sftpModal.search += msg.String()
+			m.sftpModal.cursor = 0
+			m.sftpModal.scroll = 0
 		}
 	}
 	return m, nil
@@ -5361,10 +5395,27 @@ func connectSFTPCmd(userStr, host string, port int, identityFile string) tea.Cmd
 	}
 }
 
+// sftpFilteredHosts returns the SSH config hosts that match the current search query.
+func (m Model) sftpFilteredHosts() []appsftp.SSHHost {
+	if m.sftpModal.search == "" {
+		return m.sftpModal.hosts
+	}
+	q := strings.ToLower(m.sftpModal.search)
+	var out []appsftp.SSHHost
+	for _, h := range m.sftpModal.hosts {
+		if strings.Contains(strings.ToLower(h.Alias), q) ||
+			strings.Contains(strings.ToLower(h.HostName), q) ||
+			strings.Contains(strings.ToLower(h.User), q) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // sftpModalVisibleRows returns how many list items fit in the SFTP modal viewport.
 func (m Model) sftpModalVisibleRows() int {
-	// Reserve lines for: blank, title, blank (top) + blank, hint, blank (bottom) + border + padding = ~14 lines overhead.
-	v := m.height - 14
+	// Reserve lines for: blank, title, search, blank (top) + blank, hint, blank (bottom) + border + padding = ~15 lines overhead.
+	v := m.height - 15
 	if v < 3 {
 		v = 3
 	}
@@ -5407,7 +5458,12 @@ func (m Model) renderSFTPModal() string {
 		title := StyleTitle.Render("  SFTP Connections")
 		rows = append(rows, title, "")
 
-		totalItems := len(m.sftpModal.hosts) + 1
+		// Search bar.
+		searchLine := StyleDim.Render("  / ") + StyleNormal.Render(m.sftpModal.search) + StyleCursor.Render(" ")
+		rows = append(rows, searchLine, "")
+
+		filtered := m.sftpFilteredHosts()
+		totalItems := len(filtered) + 1
 		visible := m.sftpModalVisibleRows()
 		scroll := m.sftpModal.scroll
 		end := scroll + visible
@@ -5429,7 +5485,7 @@ func (m Model) renderSFTPModal() string {
 					rows = append(rows, StyleNormal.Render(label))
 				}
 			} else {
-				host := m.sftpModal.hosts[idx-1]
+				host := filtered[idx-1]
 				u := host.User
 				if u == "" {
 					u = "~"
@@ -5453,7 +5509,7 @@ func (m Model) renderSFTPModal() string {
 			rows = append(rows, StyleSelected.Render("  "+m.sftpModal.err), "")
 		}
 
-		hint := StyleDim.Render("  j/k  navigate   enter  connect   esc  cancel")
+		hint := StyleDim.Render("  type to filter   ↑/↓  navigate   enter  connect   esc  cancel")
 		rows = append(rows, hint, "")
 	}
 
