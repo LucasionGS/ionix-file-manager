@@ -25,6 +25,7 @@ import (
 	appfs "github.com/LucasionGS/ionix-file-manager/internal/fs"
 	appgit "github.com/LucasionGS/ionix-file-manager/internal/git"
 	"github.com/LucasionGS/ionix-file-manager/internal/kitty"
+	appsftp "github.com/LucasionGS/ionix-file-manager/internal/sftp"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -77,6 +78,7 @@ type clipItem struct {
 type fileClipboard struct {
 	op    clipOp
 	items []clipItem
+	sftp  *appsftp.Client // non-nil when items come from a remote pane
 }
 
 // ---------------------------------------------------------------------------
@@ -202,11 +204,11 @@ func (m *Model) buildMenu() []menuEntry {
 		items = append(items, menuEntry{icon: "󰅎", label: "Copy path", action: menuCopyPath})
 	}
 
-	if e := selected(); hasSelection && !e.IsDir && appfs.IsImage(e.Name) {
+	if e := selected(); hasSelection && !e.IsDir && appfs.IsImage(e.Name) && !m.isRemote() {
 		items = append(items, menuEntry{icon: "󰋩", label: "Copy image", action: menuCopyImage})
 	}
 
-	if e := selected(); hasSelection && !e.IsDir {
+	if e := selected(); hasSelection && !e.IsDir && !m.isRemote() {
 		if _, ok := archiveExtractCmd(e.Path); ok {
 			items = append(items, menuEntry{icon: "󰛫", label: "Extract", action: menuExtract})
 		}
@@ -224,7 +226,7 @@ func (m *Model) buildMenu() []menuEntry {
 		items = append(items, menuEntry{icon: "󰐅", label: "Rename", action: menuRename})
 	}
 
-	if hasSelection {
+	if hasSelection && !m.isRemote() {
 		items = append(items, menuEntry{icon: "󰌋", label: "Permissions", action: menuPermissions})
 	}
 
@@ -423,6 +425,35 @@ type newItemModal struct {
 }
 
 // ---------------------------------------------------------------------------
+// SFTP connection modal
+// ---------------------------------------------------------------------------
+
+type sftpConnectModal struct {
+	open   bool
+	cursor int
+	scroll int // scroll offset for host list viewport
+	hosts  []appsftp.SSHHost // parsed from SSH config
+	// Manual entry fields
+	manual     bool
+	field      int    // 0=user, 1=host, 2=port
+	userQuery  string
+	hostQuery  string
+	portQuery  string
+	err        string
+}
+
+// sftpConnectedMsg is sent when an SFTP connection succeeds.
+type sftpConnectedMsg struct {
+	client *appsftp.Client
+	home   string // remote home directory
+}
+
+// sftpErrorMsg is sent when an SFTP connection fails.
+type sftpErrorMsg struct {
+	err error
+}
+
+// ---------------------------------------------------------------------------
 // Command palette
 // ---------------------------------------------------------------------------
 
@@ -471,7 +502,7 @@ var allPaletteCommands = []paletteCmd{
 				e := av[m.activeCursor()]
 				items = []clipItem{{path: e.Path, name: e.Name}}
 			}
-			m.clipboard = fileClipboard{op: clipCopy, items: items}
+			m.clipboard = fileClipboard{op: clipCopy, items: items, sftp: m.activeSFTP()}
 			if len(items) == 1 {
 				m.statusMsg = fmt.Sprintf("copied  %s", items[0].name)
 			} else {
@@ -494,7 +525,7 @@ var allPaletteCommands = []paletteCmd{
 				e := av[m.activeCursor()]
 				items = []clipItem{{path: e.Path, name: e.Name}}
 			}
-			m.clipboard = fileClipboard{op: clipCut, items: items}
+			m.clipboard = fileClipboard{op: clipCut, items: items, sftp: m.activeSFTP()}
 			if len(items) == 1 {
 				m.statusMsg = fmt.Sprintf("cut  %s", items[0].name)
 			} else {
@@ -508,13 +539,49 @@ var allPaletteCommands = []paletteCmd{
 			var lastErr error
 			pasteCount := len(m.clipboard.items)
 			var lastName string
+			srcSFTP := m.clipboard.sftp
+			dstSFTP := m.activeSFTP()
 			for _, item := range m.clipboard.items {
 				dst := filepath.Join(m.activeCwd(), item.name)
 				var err error
-				if m.clipboard.op == clipCopy {
-					err = appfs.CopyEntry(item.path, dst)
-				} else {
-					err = appfs.MoveEntry(item.path, dst)
+				switch {
+				case srcSFTP == nil && dstSFTP == nil:
+					if m.clipboard.op == clipCopy {
+						err = appfs.CopyEntry(item.path, dst)
+					} else {
+						err = appfs.MoveEntry(item.path, dst)
+					}
+				case srcSFTP != nil && dstSFTP != nil && srcSFTP == dstSFTP:
+					if m.clipboard.op == clipCopy {
+						err = srcSFTP.CopyRemote(item.path, dst)
+					} else {
+						err = srcSFTP.Rename(item.path, dst)
+					}
+				case srcSFTP != nil && dstSFTP == nil:
+					err = srcSFTP.DownloadFile(item.path, dst)
+					if err == nil && m.clipboard.op == clipCut {
+						_ = srcSFTP.Remove(item.path)
+					}
+				case srcSFTP == nil && dstSFTP != nil:
+					err = dstSFTP.UploadFile(item.path, dst)
+					if err == nil && m.clipboard.op == clipCut {
+						_ = os.RemoveAll(item.path)
+					}
+				default:
+					tmpDir, tmpErr := os.MkdirTemp("", "ifm-sftp-*")
+					if tmpErr != nil {
+						err = tmpErr
+					} else {
+						tmpPath := filepath.Join(tmpDir, item.name)
+						err = srcSFTP.DownloadFile(item.path, tmpPath)
+						if err == nil {
+							err = dstSFTP.UploadFile(tmpPath, dst)
+						}
+						os.RemoveAll(tmpDir)
+						if err == nil && m.clipboard.op == clipCut {
+							_ = srcSFTP.Remove(item.path)
+						}
+					}
 				}
 				if err != nil {
 					lastErr = err
@@ -597,7 +664,17 @@ var allPaletteCommands = []paletteCmd{
 			}
 		} else {
 			m.showSplit = true
-			m.cwd2 = m.cwd
+			m.sftpClient2 = nil
+			if m.sftpClient != nil {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					m.cwd2 = home
+				} else {
+					m.cwd2 = "/"
+				}
+			} else {
+				m.cwd2 = m.cwd
+			}
 			m.cursor2 = 0
 			m.offset2 = 0
 			m.reloadSplit()
@@ -650,6 +727,14 @@ var allPaletteCommands = []paletteCmd{
 	{"�󰗼", "Quit", func(m Model) (Model, tea.Cmd) {
 		stopAudio(&m.audioPlayer)
 		return m, tea.Quit
+	}},
+	{"󰒍", "Connect SFTP", func(m Model) (Model, tea.Cmd) {
+		m.openSFTPModal()
+		return m, nil
+	}},
+	{"󰩈", "Disconnect SFTP", func(m Model) (Model, tea.Cmd) {
+		m.disconnectSFTP()
+		return m, nil
 	}},
 }
 
@@ -1348,6 +1433,7 @@ var keyMap = struct {
 	Palette               key.Binding
 	RunMacro              key.Binding
 	ToggleGitPane         key.Binding
+	SFTPConnect           key.Binding
 }{
 	Up:              key.NewBinding(key.WithKeys("up", "k")),
 	Down:            key.NewBinding(key.WithKeys("down", "j")),
@@ -1375,6 +1461,7 @@ var keyMap = struct {
 	Palette:         key.NewBinding(key.WithKeys("f1")),
 	RunMacro:        key.NewBinding(key.WithKeys(",")),
 	ToggleGitPane:   key.NewBinding(key.WithKeys("G")),
+	SFTPConnect:     key.NewBinding(key.WithKeys("S")),
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,6 +1523,11 @@ type Model struct {
 	gitStatus   map[string]appgit.FileStatus // entry name → status for main pane CWD
 	gitRoot2    string                       // cached repo root for split pane
 	gitStatus2  map[string]appgit.FileStatus // entry name → status for split pane CWD
+
+	// SFTP
+	sftpModal   sftpConnectModal       // connection picker modal
+	sftpClient  *appsftp.Client        // active SFTP connection for main pane (nil = local)
+	sftpClient2 *appsftp.Client        // active SFTP connection for split pane (nil = local)
 }
 
 func buildBookmarks() []bookmark {
@@ -1534,7 +1626,13 @@ func New(startDir, selectName string) Model {
 }
 
 func (m Model) loadEntries() ([]appfs.Entry, error) {
-	all, err := appfs.List(m.cwd)
+	var all []appfs.Entry
+	var err error
+	if m.sftpClient != nil {
+		all, err = m.sftpClient.List(m.cwd)
+	} else {
+		all, err = appfs.List(m.cwd)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1638,9 +1736,28 @@ func (m Model) activeSelectedPaths() map[string]bool {
 	return m.selectedPaths
 }
 
+// activeSFTP returns the SFTP client for the currently focused pane (nil = local).
+func (m Model) activeSFTP() *appsftp.Client {
+	if m.focus == focusSplit {
+		return m.sftpClient2
+	}
+	return m.sftpClient
+}
+
+// isRemote reports whether the currently focused pane is an SFTP connection.
+func (m Model) isRemote() bool {
+	return m.activeSFTP() != nil
+}
+
 // loadEntries2 loads and filters directory entries for the second pane.
 func (m Model) loadEntries2() ([]appfs.Entry, error) {
-	all, err := appfs.List(m.cwd2)
+	var all []appfs.Entry
+	var err error
+	if m.sftpClient2 != nil {
+		all, err = m.sftpClient2.List(m.cwd2)
+	} else {
+		all, err = appfs.List(m.cwd2)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1673,19 +1790,34 @@ func (m *Model) refreshGitStatus2() {
 // reloadMain loads entries for the main pane and refreshes its git status.
 func (m *Model) reloadMain() {
 	m.entries, m.err = m.loadEntries()
-	m.refreshGitStatus()
+	if m.sftpClient == nil {
+		m.refreshGitStatus()
+	} else {
+		m.gitRoot = ""
+		m.gitStatus = nil
+	}
 }
 
 // reloadMainQuiet loads entries for the main pane (ignoring errors) and refreshes git status.
 func (m *Model) reloadMainQuiet() {
 	m.entries, _ = m.loadEntries()
-	m.refreshGitStatus()
+	if m.sftpClient == nil {
+		m.refreshGitStatus()
+	} else {
+		m.gitRoot = ""
+		m.gitStatus = nil
+	}
 }
 
 // reloadSplit loads entries for the split pane and refreshes its git status.
 func (m *Model) reloadSplit() {
 	m.entries2, _ = m.loadEntries2()
-	m.refreshGitStatus2()
+	if m.sftpClient2 == nil {
+		m.refreshGitStatus2()
+	} else {
+		m.gitRoot2 = ""
+		m.gitStatus2 = nil
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1802,6 +1934,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reloadMainQuiet()
 		return m, m.maybeLoadPreview()
 
+	case sftpConnectedMsg:
+		m.sftpModal.open = false
+		if m.focus == focusSplit {
+			m.sftpClient2 = msg.client
+			m.cwd2 = msg.home
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.reloadSplit()
+		} else {
+			m.sftpClient = msg.client
+			m.cwd = msg.home
+			m.cursor = 0
+			m.offset = 0
+			m.reloadMain()
+		}
+		m.statusMsg = fmt.Sprintf("connected to %s", msg.client.Host)
+		return m, nil
+
+	case sftpErrorMsg:
+		m.sftpModal.err = msg.err.Error()
+		return m, nil
+
 	case tea.KeyMsg:
 		// Image modal captures all input while open.
 		if m.imageModal.open {
@@ -1907,6 +2061,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// SFTP connection modal captures all input while open.
+		if m.sftpModal.open {
+			var cmd tea.Cmd
+			m, cmd = m.updateSFTPModal(msg)
+			return m, cmd
+		}
+
 		// Search captures most input while active.
 		if m.search.active {
 			var searchCmd tea.Cmd
@@ -1927,6 +2088,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			stopAudio(&m.audioPlayer)
+			if m.sftpClient != nil {
+				m.sftpClient.Close()
+			}
+			if m.sftpClient2 != nil {
+				m.sftpClient2.Close()
+			}
 			return m, tea.Quit
 
 		case key.Matches(msg, keyMap.Copy):
@@ -1945,7 +2112,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					e := av[m.activeCursor()]
 					items = []clipItem{{path: e.Path, name: e.Name}}
 				}
-				m.clipboard = fileClipboard{op: clipCopy, items: items}
+				m.clipboard = fileClipboard{op: clipCopy, items: items, sftp: m.activeSFTP()}
 				if len(items) == 1 {
 					m.statusMsg = fmt.Sprintf("copied  %s", items[0].name)
 				} else {
@@ -1958,13 +2125,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				var lastErr error
 				pasteCount := len(m.clipboard.items)
 				var lastName string
+				srcSFTP := m.clipboard.sftp
+				dstSFTP := m.activeSFTP()
 				for _, item := range m.clipboard.items {
 					dst := filepath.Join(m.activeCwd(), item.name)
 					var err error
-					if m.clipboard.op == clipCopy {
-						err = appfs.CopyEntry(item.path, dst)
-					} else {
-						err = appfs.MoveEntry(item.path, dst)
+					switch {
+					case srcSFTP == nil && dstSFTP == nil:
+						// local → local
+						if m.clipboard.op == clipCopy {
+							err = appfs.CopyEntry(item.path, dst)
+						} else {
+							err = appfs.MoveEntry(item.path, dst)
+						}
+					case srcSFTP != nil && dstSFTP != nil && srcSFTP == dstSFTP:
+						// same remote → same remote
+						if m.clipboard.op == clipCopy {
+							err = srcSFTP.CopyRemote(item.path, dst)
+						} else {
+							err = srcSFTP.Rename(item.path, dst)
+						}
+					case srcSFTP != nil && dstSFTP == nil:
+						// remote → local (download)
+						err = srcSFTP.DownloadFile(item.path, dst)
+						if err == nil && m.clipboard.op == clipCut {
+							_ = srcSFTP.Remove(item.path)
+						}
+					case srcSFTP == nil && dstSFTP != nil:
+						// local → remote (upload)
+						err = dstSFTP.UploadFile(item.path, dst)
+						if err == nil && m.clipboard.op == clipCut {
+							_ = os.RemoveAll(item.path)
+						}
+					default:
+						// different remote → remote (download then upload)
+						tmpDir, tmpErr := os.MkdirTemp("", "ifm-sftp-*")
+						if tmpErr != nil {
+							err = tmpErr
+						} else {
+							tmpPath := filepath.Join(tmpDir, item.name)
+							err = srcSFTP.DownloadFile(item.path, tmpPath)
+							if err == nil {
+								err = dstSFTP.UploadFile(tmpPath, dst)
+							}
+							os.RemoveAll(tmpDir)
+							if err == nil && m.clipboard.op == clipCut {
+								_ = srcSFTP.Remove(item.path)
+							}
+						}
 					}
 					if err != nil {
 						lastErr = err
@@ -2090,6 +2298,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openMacroModal()
 			}
 
+		case key.Matches(msg, keyMap.SFTPConnect):
+			m.openSFTPModal()
+
 		case key.Matches(msg, keyMap.ToggleSplit):
 			if m.showSplit {
 				m.showSplit = false
@@ -2098,7 +2309,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				m.showSplit = true
-				m.cwd2 = m.cwd
+				// Split pane always opens in local mode.
+				m.sftpClient2 = nil
+				if m.sftpClient != nil {
+					// Main pane is remote — open split at local home.
+					home, err := os.UserHomeDir()
+					if err == nil {
+						m.cwd2 = home
+					} else {
+						m.cwd2 = "/"
+					}
+				} else {
+					m.cwd2 = m.cwd
+				}
 				m.cursor2 = 0
 				m.offset2 = 0
 				m.reloadSplit()
@@ -2185,7 +2408,7 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			e := active[cursor]
 			items = []clipItem{{path: e.Path, name: e.Name}}
 		}
-		m.clipboard = fileClipboard{op: clipCopy, items: items}
+		m.clipboard = fileClipboard{op: clipCopy, items: items, sftp: m.activeSFTP()}
 		if len(items) == 1 {
 			m.statusMsg = fmt.Sprintf("copied  %s", items[0].name)
 		} else {
@@ -2206,7 +2429,7 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			e := active[cursor]
 			items = []clipItem{{path: e.Path, name: e.Name}}
 		}
-		m.clipboard = fileClipboard{op: clipCut, items: items}
+		m.clipboard = fileClipboard{op: clipCut, items: items, sftp: m.activeSFTP()}
 		if len(items) == 1 {
 			m.statusMsg = fmt.Sprintf("cut  %s", items[0].name)
 		} else {
@@ -2218,13 +2441,49 @@ func (m Model) execMenuAction(item menuEntry) Model {
 			var lastErr error
 			pasteCount := len(m.clipboard.items)
 			var lastName string
+			srcSFTP := m.clipboard.sftp
+			dstSFTP := m.activeSFTP()
 			for _, item := range m.clipboard.items {
 				dst := filepath.Join(m.activeCwd(), item.name)
 				var err error
-				if m.clipboard.op == clipCopy {
-					err = appfs.CopyEntry(item.path, dst)
-				} else {
-					err = appfs.MoveEntry(item.path, dst)
+				switch {
+				case srcSFTP == nil && dstSFTP == nil:
+					if m.clipboard.op == clipCopy {
+						err = appfs.CopyEntry(item.path, dst)
+					} else {
+						err = appfs.MoveEntry(item.path, dst)
+					}
+				case srcSFTP != nil && dstSFTP != nil && srcSFTP == dstSFTP:
+					if m.clipboard.op == clipCopy {
+						err = srcSFTP.CopyRemote(item.path, dst)
+					} else {
+						err = srcSFTP.Rename(item.path, dst)
+					}
+				case srcSFTP != nil && dstSFTP == nil:
+					err = srcSFTP.DownloadFile(item.path, dst)
+					if err == nil && m.clipboard.op == clipCut {
+						_ = srcSFTP.Remove(item.path)
+					}
+				case srcSFTP == nil && dstSFTP != nil:
+					err = dstSFTP.UploadFile(item.path, dst)
+					if err == nil && m.clipboard.op == clipCut {
+						_ = os.RemoveAll(item.path)
+					}
+				default:
+					tmpDir, tmpErr := os.MkdirTemp("", "ifm-sftp-*")
+					if tmpErr != nil {
+						err = tmpErr
+					} else {
+						tmpPath := filepath.Join(tmpDir, item.name)
+						err = srcSFTP.DownloadFile(item.path, tmpPath)
+						if err == nil {
+							err = dstSFTP.UploadFile(tmpPath, dst)
+						}
+						os.RemoveAll(tmpDir)
+						if err == nil && m.clipboard.op == clipCut {
+							_ = srcSFTP.Remove(item.path)
+						}
+					}
 				}
 				if err != nil {
 					lastErr = err
@@ -2372,8 +2631,15 @@ func (m Model) updateDeleteModal(msg tea.KeyMsg) Model {
 		m.deleteConfirm = deleteModal{}
 		var deleteErr error
 		deleted := 0
+		sftpConn := m.activeSFTP()
 		for _, target := range targets {
-			if err := appfs.DeleteEntry(target.Path); err != nil {
+			var err error
+			if sftpConn != nil {
+				err = sftpConn.Remove(target.Path)
+			} else {
+				err = appfs.DeleteEntry(target.Path)
+			}
+			if err != nil {
 				deleteErr = err
 			} else {
 				deleted++
@@ -2421,7 +2687,14 @@ func (m Model) updateRenameModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 		old := m.renameModal.target.Path
 		newPath := filepath.Join(filepath.Dir(old), newName)
 		m.renameModal = renameModal{}
-		if err := appfs.MoveEntry(old, newPath); err != nil {
+		sftpConn := m.activeSFTP()
+		var err error
+		if sftpConn != nil {
+			err = sftpConn.Rename(old, newPath)
+		} else {
+			err = appfs.MoveEntry(old, newPath)
+		}
+		if err != nil {
 			m.statusMsg = fmt.Sprintf("rename error: %v", err)
 		} else {
 			m.statusMsg = fmt.Sprintf("renamed  %s", newName)
@@ -2632,19 +2905,32 @@ func (m Model) updateNewItemModal(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		m.newItem = newItemModal{}
 		base := m.activeCwd()
+		sftpConn := m.activeSFTP()
 		var firstCreated string
 		created, errCount := 0, 0
 		var lastErr error
 		for _, p := range paths {
 			target := filepath.Join(base, p)
 			var err error
-			if kind == newItemDir {
-				err = appfs.MkdirEntry(target)
-			} else {
-				if dirErr := appfs.MkdirEntry(filepath.Dir(target)); dirErr != nil {
-					err = dirErr
+			if sftpConn != nil {
+				if kind == newItemDir {
+					err = sftpConn.Mkdir(target)
 				} else {
-					err = appfs.CreateFileEntry(target)
+					err = sftpConn.Mkdir(filepath.Dir(target))
+					if err == nil {
+						// Create empty file on remote.
+						err = sftpConn.UploadFile("/dev/null", target)
+					}
+				}
+			} else {
+				if kind == newItemDir {
+					err = appfs.MkdirEntry(target)
+				} else {
+					if dirErr := appfs.MkdirEntry(filepath.Dir(target)); dirErr != nil {
+						err = dirErr
+					} else {
+						err = appfs.CreateFileEntry(target)
+					}
 				}
 			}
 			if err != nil {
@@ -3188,6 +3474,8 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 				m.cwd = filepath.Dir(m.cwd)
 				m.reloadMainQuiet()
 			}
+		} else if m.sftpClient != nil {
+			m.statusMsg = "cannot open remote files directly"
 		} else if appfs.IsImage(entry.Name) {
 			if !kitty.IsSupported() {
 				m.statusMsg = "image preview requires kitty terminal"
@@ -3205,12 +3493,19 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 
 	case key.Matches(msg, keyMap.GoHome):
-		home, err := os.UserHomeDir()
-		if err == nil {
-			m.cwd = home
+		if m.sftpClient != nil {
+			m.cwd = "/"
 			m.cursor = 0
 			m.offset = 0
 			m.reloadMain()
+		} else {
+			home, err := os.UserHomeDir()
+			if err == nil {
+				m.cwd = home
+				m.cursor = 0
+				m.offset = 0
+				m.reloadMain()
+			}
 		}
 
 	case key.Matches(msg, keyMap.ToggleHidden):
@@ -3366,6 +3661,8 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.cursor2 = 0
 			m.offset2 = 0
 			m.reloadSplit()
+		} else if m.sftpClient2 != nil {
+			m.statusMsg = "cannot open remote files directly"
 		} else if appfs.IsImage(entry.Name) {
 			if !kitty.IsSupported() {
 				m.statusMsg = "image preview requires kitty terminal"
@@ -3383,12 +3680,19 @@ func (m Model) updateSplitPane(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 
 	case key.Matches(msg, keyMap.GoHome):
-		home, err := os.UserHomeDir()
-		if err == nil {
-			m.cwd2 = home
+		if m.sftpClient2 != nil {
+			m.cwd2 = "/"
 			m.cursor2 = 0
 			m.offset2 = 0
 			m.reloadSplit()
+		} else {
+			home, err := os.UserHomeDir()
+			if err == nil {
+				m.cwd2 = home
+				m.cursor2 = 0
+				m.offset2 = 0
+				m.reloadSplit()
+			}
 		}
 
 	case key.Matches(msg, keyMap.ToggleHidden):
@@ -3511,6 +3815,10 @@ func (m Model) View() string {
 
 	if m.macroRunner.open {
 		return m.renderMacroModal()
+	}
+
+	if m.sftpModal.open {
+		return m.renderSFTPModal()
 	}
 
 	if m.imageModal.open {
@@ -3674,11 +3982,28 @@ func (m Model) renderNormal() string {
 
 	hn, _ := os.Hostname()
 
-	titleLine := StyleTitle.Render(" "+hn+" ") +
-		StyleDim.Render(" › ") +
-		StyleNormal.Render(m.cwd)
+	// Build main pane title label with SFTP indicator.
+	var mainTitle string
+	if m.sftpClient != nil {
+		mainTitle = StyleSFTPIndicator.Render(" 󰒍 SFTP "+m.sftpClient.User+"@"+m.sftpClient.Host+" ") +
+			StyleDim.Render(" › ") +
+			StyleNormal.Render(m.cwd)
+	} else {
+		mainTitle = StyleTitle.Render(" "+hn+" ") +
+			StyleDim.Render(" › ") +
+			StyleNormal.Render(m.cwd)
+	}
+
+	titleLine := mainTitle
 	if m.showSplit {
-		titleLine += StyleDim.Render("  |  ") + StyleNormal.Render(m.cwd2)
+		if m.sftpClient2 != nil {
+			titleLine += StyleDim.Render("  |  ") +
+				StyleSFTPIndicator.Render(" 󰒍 SFTP "+m.sftpClient2.User+"@"+m.sftpClient2.Host+" ") +
+				StyleDim.Render(" › ") +
+				StyleNormal.Render(m.cwd2)
+		} else {
+			titleLine += StyleDim.Render("  |  ") + StyleNormal.Render(m.cwd2)
+		}
 	}
 
 	cols := []string{m.renderSidebar(listH), m.renderFileList(listH, listW)}
@@ -4222,12 +4547,18 @@ func (m Model) buildStatus() string {
 		"[w] Sidebar",
 		"[e] Panes",
 		"[s] Split",
+		"[S] SFTP",
 		"[H] Hidden",
 		"[:] Go to",
 		"[q] Quit",
 	}
 
-	return " " + strings.Join(parts, " | ") + clip + sel
+	sftpTag := ""
+	if m.activeSFTP() != nil {
+		sftpTag = "  [SFTP]"
+	}
+
+	return " " + strings.Join(parts, " | ") + clip + sel + sftpTag
 }
 
 // ---------------------------------------------------------------------------
@@ -4825,4 +5156,307 @@ func (m Model) renderMacroManagerForm() string {
 		out += kitty.ClearAll()
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// SFTP connection modal
+// ---------------------------------------------------------------------------
+
+// openSFTPModal initialises the SFTP connection picker.
+func (m *Model) openSFTPModal() {
+	hosts := appsftp.ParseSSHConfig()
+	u, _ := user.Current()
+	defaultUser := "root"
+	if u != nil {
+		defaultUser = u.Username
+	}
+	m.sftpModal = sftpConnectModal{
+		open:      true,
+		hosts:     hosts,
+		cursor:    0,
+		manual:    false,
+		userQuery: defaultUser,
+		portQuery: "22",
+	}
+	m.statusMsg = ""
+}
+
+// disconnectSFTP closes the active SFTP connection for the focused pane and
+// returns to local browsing.
+func (m *Model) disconnectSFTP() {
+	if m.focus == focusSplit {
+		if m.sftpClient2 != nil {
+			m.sftpClient2.Close()
+			m.sftpClient2 = nil
+			home, err := os.UserHomeDir()
+			if err == nil {
+				m.cwd2 = home
+			} else {
+				m.cwd2 = "/"
+			}
+			m.cursor2 = 0
+			m.offset2 = 0
+			m.reloadSplit()
+			m.statusMsg = "disconnected from SFTP"
+		}
+	} else {
+		if m.sftpClient != nil {
+			m.sftpClient.Close()
+			m.sftpClient = nil
+			home, err := os.UserHomeDir()
+			if err == nil {
+				m.cwd = home
+			} else {
+				m.cwd = "/"
+			}
+			m.cursor = 0
+			m.offset = 0
+			m.reloadMain()
+			m.statusMsg = "disconnected from SFTP"
+		}
+	}
+}
+
+func (m Model) updateSFTPModal(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if m.sftpModal.manual {
+		return m.updateSFTPManualEntry(msg)
+	}
+
+	totalItems := len(m.sftpModal.hosts) + 1 // +1 for "Connect to SFTP..." at top
+
+	switch {
+	case msg.Type == tea.KeyEsc:
+		m.sftpModal = sftpConnectModal{}
+
+	case key.Matches(msg, keyMap.Up):
+		if m.sftpModal.cursor > 0 {
+			m.sftpModal.cursor--
+			if m.sftpModal.cursor < m.sftpModal.scroll {
+				m.sftpModal.scroll = m.sftpModal.cursor
+			}
+		}
+
+	case key.Matches(msg, keyMap.Down):
+		if m.sftpModal.cursor < totalItems-1 {
+			m.sftpModal.cursor++
+			visible := m.sftpModalVisibleRows()
+			if m.sftpModal.cursor >= m.sftpModal.scroll+visible {
+				m.sftpModal.scroll = m.sftpModal.cursor - visible + 1
+			}
+		}
+
+	case key.Matches(msg, keyMap.Right), msg.Type == tea.KeyEnter:
+		if m.sftpModal.cursor == 0 {
+			// Manual entry mode.
+			m.sftpModal.manual = true
+			m.sftpModal.field = 0
+			m.sftpModal.err = ""
+		} else {
+			// Connect to selected SSH host.
+			host := m.sftpModal.hosts[m.sftpModal.cursor-1]
+			u := host.User
+			if u == "" {
+				cu, _ := user.Current()
+				if cu != nil {
+					u = cu.Username
+				} else {
+					u = "root"
+				}
+			}
+			return m, connectSFTPCmd(u, host.HostName, host.Port, host.IdentityFile)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) updateSFTPManualEntry(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.sftpModal.manual = false
+		m.sftpModal.err = ""
+
+	case tea.KeyTab:
+		m.sftpModal.field = (m.sftpModal.field + 1) % 3
+
+	case tea.KeyShiftTab:
+		m.sftpModal.field = (m.sftpModal.field + 2) % 3
+
+	case tea.KeyEnter:
+		u := strings.TrimSpace(m.sftpModal.userQuery)
+		h := strings.TrimSpace(m.sftpModal.hostQuery)
+		p := strings.TrimSpace(m.sftpModal.portQuery)
+		if h == "" {
+			m.sftpModal.err = "hostname is required"
+			return m, nil
+		}
+		if u == "" {
+			u = "root"
+		}
+		port := 22
+		if p != "" {
+			var err error
+			port, err = strconv.Atoi(p)
+			if err != nil || port < 1 || port > 65535 {
+				m.sftpModal.err = "invalid port number"
+				return m, nil
+			}
+		}
+		return m, connectSFTPCmd(u, h, port, "")
+
+	case tea.KeyBackspace:
+		switch m.sftpModal.field {
+		case 0:
+			if r := []rune(m.sftpModal.userQuery); len(r) > 0 {
+				m.sftpModal.userQuery = string(r[:len(r)-1])
+			}
+		case 1:
+			if r := []rune(m.sftpModal.hostQuery); len(r) > 0 {
+				m.sftpModal.hostQuery = string(r[:len(r)-1])
+			}
+		case 2:
+			if r := []rune(m.sftpModal.portQuery); len(r) > 0 {
+				m.sftpModal.portQuery = string(r[:len(r)-1])
+			}
+		}
+
+	default:
+		if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+			ch := msg.String()
+			switch m.sftpModal.field {
+			case 0:
+				m.sftpModal.userQuery += ch
+			case 1:
+				m.sftpModal.hostQuery += ch
+			case 2:
+				m.sftpModal.portQuery += ch
+			}
+		}
+	}
+	return m, nil
+}
+
+// connectSFTPCmd returns a tea.Cmd that dials an SFTP connection in the background.
+func connectSFTPCmd(userStr, host string, port int, identityFile string) tea.Cmd {
+	return func() tea.Msg {
+		var client *appsftp.Client
+		var err error
+		if identityFile != "" {
+			client, err = appsftp.DialWithKey(userStr, host, port, identityFile)
+		} else {
+			client, err = appsftp.Dial(userStr, host, port)
+		}
+		if err != nil {
+			return sftpErrorMsg{err: err}
+		}
+		// Determine remote home directory.
+		home := "/home/" + userStr
+		if userStr == "root" {
+			home = "/root"
+		}
+		// Try to stat the guessed home; fall back to /.
+		if _, statErr := client.Stat(home); statErr != nil {
+			home = "/"
+		}
+		return sftpConnectedMsg{client: client, home: home}
+	}
+}
+
+// sftpModalVisibleRows returns how many list items fit in the SFTP modal viewport.
+func (m Model) sftpModalVisibleRows() int {
+	// Reserve lines for: blank, title, blank (top) + blank, hint, blank (bottom) + border + padding = ~14 lines overhead.
+	v := m.height - 14
+	if v < 3 {
+		v = 3
+	}
+	return v
+}
+
+func (m Model) renderSFTPModal() string {
+	const modalW = 60
+
+	var rows []string
+	rows = append(rows, "")
+
+	if m.sftpModal.manual {
+		title := StyleTitle.Render("  Connect to SFTP")
+		rows = append(rows, title, "")
+
+		renderField := func(label, value string, fieldIdx int) string {
+			lbl := StyleDim.Render("  " + label + ":")
+			var valLine string
+			if m.sftpModal.field == fieldIdx {
+				valLine = StyleNormal.Render("  "+value) + StyleCursor.Render(" ")
+			} else {
+				valLine = StyleDim.Render("  " + value)
+			}
+			return lbl + "\n" + valLine
+		}
+
+		rows = append(rows, renderField("User", m.sftpModal.userQuery, 0))
+		rows = append(rows, renderField("Host", m.sftpModal.hostQuery, 1))
+		rows = append(rows, renderField("Port", m.sftpModal.portQuery, 2))
+		rows = append(rows, "")
+
+		if m.sftpModal.err != "" {
+			rows = append(rows, StyleSelected.Render("  "+m.sftpModal.err), "")
+		}
+
+		hint := StyleDim.Render("  tab  next field   enter  connect   esc  back")
+		rows = append(rows, hint, "")
+	} else {
+		title := StyleTitle.Render("  SFTP Connections")
+		rows = append(rows, title, "")
+
+		totalItems := len(m.sftpModal.hosts) + 1
+		visible := m.sftpModalVisibleRows()
+		scroll := m.sftpModal.scroll
+		end := scroll + visible
+		if end > totalItems {
+			end = totalItems
+		}
+
+		if scroll > 0 {
+			rows = append(rows, StyleDim.Render(fmt.Sprintf("  ↑ %d more", scroll)))
+		}
+
+		for idx := scroll; idx < end; idx++ {
+			if idx == 0 {
+				// First item: manual connect.
+				label := "  󰒍  Connect to SFTP..."
+				if m.sftpModal.cursor == 0 {
+					rows = append(rows, StyleCursor.Width(modalW-4).Render(label))
+				} else {
+					rows = append(rows, StyleNormal.Render(label))
+				}
+			} else {
+				host := m.sftpModal.hosts[idx-1]
+				u := host.User
+				if u == "" {
+					u = "~"
+				}
+				if m.sftpModal.cursor == idx {
+					rows = append(rows, StyleCursor.Width(modalW-4).Render(
+						fmt.Sprintf("  󰣀  %s  %s@%s", host.Alias, u, host.HostName)))
+				} else {
+					rows = append(rows, fmt.Sprintf("  󰣀  %s  %s", host.Alias, StyleDim.Render(u+"@"+host.HostName)))
+				}
+			}
+		}
+
+		if end < totalItems {
+			rows = append(rows, StyleDim.Render(fmt.Sprintf("  ↓ %d more", totalItems-end)))
+		}
+
+		rows = append(rows, "")
+
+		if m.sftpModal.err != "" {
+			rows = append(rows, StyleSelected.Render("  "+m.sftpModal.err), "")
+		}
+
+		hint := StyleDim.Render("  j/k  navigate   enter  connect   esc  cancel")
+		rows = append(rows, hint, "")
+	}
+
+	box := StylePaneActive.Width(modalW).Render(strings.Join(rows, "\n"))
+	return m.overlayModal(box)
 }

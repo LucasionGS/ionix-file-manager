@@ -50,6 +50,7 @@ var (
 	StyleGitDeleted            lipgloss.Style
 	StyleGitConflict           lipgloss.Style
 	StyleGitRenamed            lipgloss.Style
+	StyleSFTPIndicator         lipgloss.Style
 )
 
 func init() {
@@ -161,4 +162,9 @@ func ApplyColors(c appconfig.Colors) {
 	StyleGitDeleted = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#b91c1c", Dark: "#f87171"})
 	StyleGitConflict = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#b91c1c", Dark: "#f87171"}).Bold(true)
 	StyleGitRenamed = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#1d4ed8", Dark: "#60a5fa"})
+
+	StyleSFTPIndicator = lipgloss.NewStyle().
+		Background(lipgloss.AdaptiveColor{Light: "#1d4ed8", Dark: "#2563eb"}).
+		Foreground(lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#ffffff"}).
+		Bold(true)
 }
